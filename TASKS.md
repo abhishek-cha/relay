@@ -125,10 +125,12 @@ Break any of these and the product stops being Relay.
 - [x] Response body is parsed as JSON when the content type says so, with a raw fallback
 - [x] Structured errors (§26): map status/transport failures → `AUTH_REQUIRED`, `AUTH_FAILED`, `PERMISSION_DENIED`, `RATE_LIMITED`, `REMOTE_ERROR`, `NETWORK_ERROR`, `TIMEOUT`
 - [x] Context timeouts and cancellation; retry/backoff for 429/5xx honoring `Retry-After`, bounded attempts
-- [ ] Pagination (§20): a declared strategy (Link header and cursor param at minimum)
-      Deferred on purpose: the manifest has no pagination block yet, so there is
-      nothing for a tool to declare. The executor performs one request; Link-header
-      and cursor strategies land together with the manifest field that expresses them.
+- [~] Pagination (§20): a declared strategy (Link header and cursor param at minimum)
+      The manifest `request.pagination` block and both strategies (`link-header`,
+      `cursor`) are implemented in `internal/protocol/rest` behind overridable page
+      and total-byte caps, and the no-pagination path is unchanged. Remaining: `specFor`
+      does not project the block into `protocol.Spec` and nothing sets `Request.Paginate`,
+      so a walk is not yet reachable end-to-end.
 - [x] Protocol dispatch from `protocol.type`; unknown or unimplemented type → `PROTOCOL_ERROR`
 
 **Notes.** Retries are limited to idempotent methods (GET/HEAD/PUT/DELETE); a POST is
@@ -280,17 +282,28 @@ request input value finds nothing.
 
 - [x] `GraphQLExecutor` (`protocol.type: graphql`) — query and variables from the manifest; CLI and MCP unchanged — `internal/protocol/graphql`
 - [x] `GRPCExecutor` (`protocol.type: grpc`) — address from `protocol.endpoint`, method from `request.path` (`/package.Service/Method`), JSON message body; descriptors resolved through server reflection v1, so no generated stubs. Failures map onto §26: `NETWORK_ERROR`, `TIMEOUT`, `REMOTE_ERROR` with the status code, `PROTOCOL_ERROR` for an unresolvable method — `internal/protocol/grpc`
-- [ ] `BrowserExecutor` (§23) — shared login, cookies, sessions, OAuth, web interaction
+- [~] `BrowserExecutor` (§23) — shared login, cookies, sessions, OAuth, web interaction
+      A session-carrying HTTP executor on `net/http` + `cookiejar` is in place
+      (`internal/browser`, `internal/protocol/browser`): form and header login from the
+      Keychain, persisted per-tool sessions at `$RELAY_HOME/sessions/`, `AUTH_REQUIRED`
+      with no session, and no cross-host cookie leak on redirect. JavaScript/DOM
+      interaction is out of scope by design; the OAuth2 redirect flow is not yet built.
+      Remaining: the daemon does not handle the `session_login`/`session_clear` frames,
+      so no login can reach the store.
 
 ---
+
+### M10 follow-up
+
+- [ ] A gRPC operation is addressed through `request.path` only (`/package.Service/Method`); add literal `request.package` / `request.service` / `request.method` manifest fields and project them in `specFor` — `internal/manifest`, `internal/protocol/grpc`
 
 ## M11 — Security, permissions, distribution  (§24, §25, §40, §41, §47, §48, §49)
 
 - [x] Capability declarations: `network`, `keychain`, `browser`, `filesystem.read`, `filesystem.write`, `shell`, `notifications`, `clipboard` — `internal/permissions`
 - [x] Permission policy: host allowlists, filesystem scopes; a tool asking for a new capability is not silently granted it — `internal/permissions/policy.go`, enforced in `internal/daemon/permissions.go`
-- [x] Confirmation policy for destructive operations (`delete_repository`, `send_message`, `charge_customer`) with CLI and MCP parity — `CodeConfirmationRequired` → `PERMISSION_DENIED` on both paths
-- [ ] `relayd --destructive-op` (or a config file) so the daemon's destructive list is set without a code change — `Config.DestructiveOps` exists but nothing populates it
-- [ ] Interactive confirmation prompt for destructive operations — today a matched operation is refused outright
+- [x] Confirmation policy for destructive operations (`delete_repository`, `send_message`, `charge_customer`) with CLI and MCP parity — the CLI can clear the gate with a confirmation token; MCP carries no token and is denied (`PERMISSION_DENIED`, §41)
+- [x] The daemon's destructive list is set without a code change — `$RELAY_HOME/config/permissions.yaml`; a missing file keeps the built-in default list on, a malformed one refuses to start — `internal/daemon/permissions_config.go`
+- [x] Interactive confirmation prompt for destructive operations — a gated operation returns `CONFIRMATION_REQUIRED`, and `relay run` prompts on stderr only when stdin is a TTY (never auto-confirming) — `internal/ipc/confirm.go`, `cmd/relay/main.go`
 - [x] Signed tools: verify publisher, signature, binary, and manifest at install (§48) — ed25519 over a domain-separated canonical byte string that binds the manifest digest, the descriptor digest, and the binary digest, so swapping the executable invalidates the signature; `relay keygen` / `relay sign`, sidecar `<binary>.sig`, refused with `SIGNATURE_INVALID` before anything is copied — `internal/sign`
 - [x] Trust levels: trusted / verified / unknown / blocked (§49) — a `blocked` rule wins even over a valid signature, an allowlisted tool is `trusted` without one, a verified signature is `verified`, and an unsigned tool still installs as `unknown` rather than being refused — `$RELAY_HOME/config/trust.yaml`, `internal/registry/trust.go`
 - [ ] Hosted registry, `relay search`, `relay install <name>` (§47)
