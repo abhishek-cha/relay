@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"time"
 
+	"relay/internal/ipc"
 	"relay/internal/manifest"
 	"relay/internal/paths"
 	"relay/internal/registry"
@@ -65,8 +66,90 @@ type RegistrySource struct {
 	// Read reads a tool's manifest from its installed path. Defaults to
 	// ExecManifestReader.
 	Read ManifestReader
+	// Skill reads a tool's embedded SKILL.md through the daemon. It defaults to
+	// DaemonSkill, which is the only path allowed to run an installed binary
+	// (spec §27); the text itself is never cached (spec §16).
+	Skill SkillReader
 	// Log receives diagnostics about skipped tools. Never stdout.
 	Log io.Writer
+}
+
+// SkillReader reads one registered tool's embedded SKILL.md through the daemon
+// (spec §8, §29). The daemon re-reads the tool binary on every request, so the
+// binary stays authoritative for its own skill (spec §16).
+type SkillReader func(ctx context.Context, tool string) (string, *relay.Error)
+
+// DaemonSkill is the production SkillReader: it asks the daemon over IPC, the
+// same way tool invocation reaches the daemon (spec §27, §29).
+//
+// Reading through the daemon rather than executing the binary here is what keeps
+// MCP from growing a second execution path, and with it a second credential
+// route (spec §41).
+type DaemonSkill struct {
+	// Socket is the daemon socket. Empty means the default Relay home's socket.
+	Socket string
+}
+
+// ReadSkill implements SkillReader. Transport failures become the same
+// NETWORK_ERROR/TIMEOUT codes the CLI reports (spec §26).
+func (d DaemonSkill) ReadSkill(ctx context.Context, tool string) (string, *relay.Error) {
+	socket := d.Socket
+	if socket == "" {
+		socket = paths.Default().Socket()
+	}
+
+	var response ipc.SkillResponse
+	if err := ipc.Call(ctx, socket, ipc.SkillRequest{Type: ipc.FrameSkill, Tool: tool}, &response); err != nil {
+		if errors.Is(err, ipc.ErrTimeout) {
+			return "", relay.NewError(relay.CodeTimeout,
+				"the Relay daemon did not respond in time")
+		}
+		return "", relay.NewError(relay.CodeNetworkError,
+			"the Relay daemon is not available; start it with 'relay daemon start'")
+	}
+	if !response.Success || response.Error != nil {
+		if response.Error == nil {
+			return "", relay.NewError(relay.CodeRemoteError, "the daemon returned no skill")
+		}
+		return "", response.Error
+	}
+	return response.Skill, nil
+}
+
+// ListSkills implements SkillSource. Discovery comes from the registry's
+// recorded skill flag (spec §15); the registry never stores the text itself
+// (spec §16), so this stays cheap and cannot drift from the binary.
+func (s *RegistrySource) ListSkills(ctx context.Context) ([]SkillResource, error) {
+	if s.Registry == nil {
+		return nil, fmt.Errorf("no registry is configured")
+	}
+	installations, err := s.Registry.List()
+	if err != nil {
+		return nil, fmt.Errorf("list registry: %w", err)
+	}
+	resources := make([]SkillResource, 0, len(installations))
+	for _, installation := range installations {
+		if installation.Name == "" || !installation.Skill {
+			continue
+		}
+		resources = append(resources, SkillResource{
+			Tool:        installation.Name,
+			Name:        installation.Name,
+			Description: "Embedded SKILL.md for the " + installation.Name + " tool",
+		})
+	}
+	return resources, nil
+}
+
+// ReadSkill implements SkillSource. It delegates to the configured reader, so
+// the text always comes from the binary via the daemon and is never a cached
+// copy (spec §16).
+func (s *RegistrySource) ReadSkill(ctx context.Context, tool string) (string, *relay.Error) {
+	read := s.Skill
+	if read == nil {
+		read = DaemonSkill{}.ReadSkill
+	}
+	return read(ctx, tool)
 }
 
 // ListTools implements DescriptorSource.
@@ -210,12 +293,15 @@ func (d DaemonInvoker) Invoke(ctx context.Context, tool, operation string, input
 // runtime's IPC path (spec §27, §41). The Relay home is passed explicitly so a
 // caller can honor --home and tests can point at a temporary directory.
 func New(layout paths.Layout, version string, log io.Writer) *Server {
+	source := &RegistrySource{
+		Registry: registry.New(layout.Registry),
+		Read:     ExecManifestReader,
+		Skill:    DaemonSkill{Socket: layout.Socket()}.ReadSkill,
+		Log:      log,
+	}
 	return &Server{
-		Source: &RegistrySource{
-			Registry: registry.New(layout.Registry),
-			Read:     ExecManifestReader,
-			Log:      log,
-		},
+		Source:  source,
+		Skills:  source,
 		Invoker: DaemonInvoker{Operations: toolruntime.DaemonInvoker{}},
 		Info:    ServerInfo{Name: relay.RuntimeName, Version: version},
 		Log:     log,

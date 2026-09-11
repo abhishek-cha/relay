@@ -57,6 +57,9 @@ type rpcResponse struct {
 type rpcError struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
+	// Data optionally carries a structured relay error so a protocol-level
+	// failure still exposes the §26 code (spec §26, §29).
+	Data any `json:"data,omitempty"`
 }
 
 // ToolDescriptor describes one MCP-exposed tool with the input schema an MCP
@@ -117,8 +120,12 @@ type ServerInfo struct {
 type Server struct {
 	Source  DescriptorSource
 	Invoker Invoker
-	Info    ServerInfo
-	Log     io.Writer // receives non-fatal diagnostics; never stdout
+	// Skills exposes each registered tool's embedded SKILL.md as an MCP
+	// resource (spec §8, §29). A nil source advertises no resources rather than
+	// failing the method, so the server stays usable in discovery-only setups.
+	Skills SkillSource
+	Info   ServerInfo
+	Log    io.Writer // receives non-fatal diagnostics; never stdout
 
 	mu          sync.Mutex
 	descriptors []ToolDescriptor
@@ -184,6 +191,10 @@ func (s *Server) dispatch(ctx context.Context, msg *rpcRequest, w io.Writer) {
 		s.handleToolsList(ctx, msg, w)
 	case "tools/call":
 		s.handleToolsCall(ctx, msg, w)
+	case "resources/list":
+		s.handleResourcesList(ctx, msg, w)
+	case "resources/read":
+		s.handleResourcesRead(ctx, msg, w)
 	case "ping":
 		s.handlePing(msg, w)
 	case "":
@@ -199,7 +210,8 @@ func (s *Server) handleInitialize(msg *rpcRequest, w io.Writer) {
 	s.sendResult(w, msg.ID, map[string]any{
 		"protocolVersion": ProtocolVersion,
 		"capabilities": map[string]any{
-			"tools": map[string]any{},
+			"tools":     map[string]any{},
+			"resources": map[string]any{},
 		},
 		"serverInfo": s.Info,
 	})

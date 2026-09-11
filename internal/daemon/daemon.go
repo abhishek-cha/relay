@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"relay/internal/auth"
+	"relay/internal/ipc"
 	"relay/internal/keychain"
 	"relay/internal/manifest"
 	"relay/internal/paths"
@@ -158,6 +159,13 @@ func (d *Daemon) Handle(ctx context.Context, kind string, frame []byte) (any, er
 			return failedInspect(failure), nil
 		}
 		return d.inspect(ctx, request.Tool), nil
+
+	case ipc.FrameSkill:
+		var request ipc.SkillRequest
+		if failure := decode(frame, &request); failure != nil {
+			return failedSkill(failure), nil
+		}
+		return d.skill(ctx, request.Tool), nil
 
 	case relay.FrameStatus:
 		return d.status(), nil

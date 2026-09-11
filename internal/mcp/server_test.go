@@ -370,7 +370,7 @@ func TestToolsCallMissingParams(t *testing.T) {
 
 func TestUnknownMethod(t *testing.T) {
 	s := newServer(&stubSource{}, &stubInvoker{})
-	_, responses := serve(t, s, `{"jsonrpc":"2.0","id":10,"method":"resources/list"}`)
+	_, responses := serve(t, s, `{"jsonrpc":"2.0","id":10,"method":"prompts/list"}`)
 
 	resp := requireOne(t, responses)
 	if resp.Error == nil || resp.Error.Code != CodeMethodNotFound {
