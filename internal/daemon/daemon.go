@@ -9,6 +9,8 @@ import (
 	"os"
 	"time"
 
+	"relay/internal/auth"
+	"relay/internal/keychain"
 	"relay/internal/manifest"
 	"relay/internal/paths"
 	"relay/internal/protocol"
@@ -30,6 +32,10 @@ type Config struct {
 	// with no entry is rejected with PROTOCOL_ERROR rather than guessed at
 	// (spec §19).
 	Executors map[string]protocol.Executor
+	// Keychain resolves tool credentials (spec §21, §22). It defaults to the
+	// macOS Keychain; tests inject a fake Store so the daemon is constructible
+	// without touching the real Keychain.
+	Keychain keychain.Store
 	// ToolTimeout bounds a tool's discovery reply. Defaults to 10s.
 	ToolTimeout time.Duration
 	// Now is the clock, injectable so uptime and install timestamps are testable.
@@ -46,6 +52,7 @@ type Daemon struct {
 	layout      paths.Layout
 	version     string
 	store       *registry.Store
+	resolver    *auth.Resolver
 	executors   map[string]protocol.Executor
 	toolTimeout time.Duration
 	now         func() time.Time
@@ -78,10 +85,15 @@ func New(cfg Config) *Daemon {
 	if socket == "" {
 		socket = cfg.Layout.Socket()
 	}
+	keychainStore := cfg.Keychain
+	if keychainStore == nil {
+		keychainStore = &keychain.SecurityStore{}
+	}
 	return &Daemon{
 		layout:      cfg.Layout,
 		version:     cfg.Version,
 		store:       registry.New(cfg.Layout.Registry),
+		resolver:    auth.New(keychainStore),
 		executors:   executors,
 		toolTimeout: timeout,
 		now:         now,
@@ -148,6 +160,27 @@ func (d *Daemon) Handle(ctx context.Context, kind string, frame []byte) (any, er
 			return failedMutation(failure), nil
 		}
 		return d.remove(request.Tool), nil
+
+	case relay.FrameAuthSet:
+		var request relay.AuthSetRequest
+		if failure := decode(frame, &request); failure != nil {
+			return failedMutation(failure), nil
+		}
+		return d.authSet(ctx, request), nil
+
+	case relay.FrameAuthClear:
+		var request relay.AuthClearRequest
+		if failure := decode(frame, &request); failure != nil {
+			return failedMutation(failure), nil
+		}
+		return d.authClear(request), nil
+
+	case relay.FrameAuthStatus:
+		var request relay.AuthStatusRequest
+		if failure := decode(frame, &request); failure != nil {
+			return failedAuthStatus(failure), nil
+		}
+		return d.authStatus(ctx, request), nil
 
 	default:
 		return map[string]any{
@@ -224,16 +257,31 @@ func (d *Daemon) invoke(ctx context.Context, request relay.InvokeRequest) relay.
 			fmt.Sprintf("this Relay build has no executor for protocol %q", doc.Protocol.Type)))
 	}
 
+	credential, failure := d.credential(doc, installation)
+	if failure != nil {
+		return invokeFailure(failure)
+	}
+
 	response, err := executor.Execute(ctx, protocol.Request{
 		Tool:       installation.Name,
 		Operation:  operation.Name,
 		Input:      request.Input,
-		Credential: d.credential(doc, installation),
+		Credential: credential,
 		Spec:       specFor(doc, operation),
 	})
 	if err != nil {
 		var structured *relay.Error
 		if errors.As(err, &structured) {
+			// A 401 on a request that carried a daemon-injected credential means
+			// the stored secret was refused, not that the user never logged in.
+			// Only the daemon knows whether a credential was injected, so the
+			// executor cannot make this distinction itself (spec §26).
+			if credential != nil && structured.Code == relay.CodeAuthRequired {
+				structured = relay.NewError(relay.CodeAuthFailed,
+					fmt.Sprintf("the service rejected the stored credential for %q; run 'relay auth login %s' to replace it",
+						installation.Name, installation.Name)).
+					WithDetails(structured.Details)
+			}
 			return invokeFailure(structured)
 		}
 		return invokeFailure(relay.NewError(relay.CodeProtocolError, err.Error()))
@@ -242,15 +290,19 @@ func (d *Daemon) invoke(ctx context.Context, request relay.InvokeRequest) relay.
 	return relay.InvokeResponse{Success: true, Result: response.Body}
 }
 
-// credential resolves the secret to inject at execution time.
+// credential resolves the secret to inject at execution time (spec §21, §22).
 //
-// Keychain lookup lands with TASKS.md milestone M4. Until then a tool that
-// declares auth runs unauthenticated, and a service that rejects an anonymous
-// request produces AUTH_REQUIRED through the normal error mapping. That keeps the
-// mapping honest instead of inventing a failure the service never reported
-// (spec §21, §26).
-func (d *Daemon) credential(*manifest.Document, relay.Installation) *protocol.Credential {
-	return nil
+// The daemon owns credentials, so an installed tool never sees one: the
+// resolver reads it from the Keychain and returns a presentation the executor
+// attaches to the outbound request.
+//
+// This replaces the pre-M4 stub, which always returned nil. A tool that
+// declares auth and has no stored credential now fails AUTH_REQUIRED before any
+// request is sent, instead of silently running unauthenticated and letting the
+// service answer. A tool that declares no auth is unaffected and still runs
+// with no credential.
+func (d *Daemon) credential(doc *manifest.Document, installation relay.Installation) (*protocol.Credential, *relay.Error) {
+	return d.resolver.Resolve(doc, installation.Name)
 }
 
 // list reports the registry.
