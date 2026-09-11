@@ -245,6 +245,25 @@ func Call(ctx context.Context, path string, request, response any) error {
 	return client.Call(ctx, request, response)
 }
 
+// CallWithTimeout is Call with an explicit exchange bound.
+//
+// Client.Call only ever shortens its deadline against the context, so a caller
+// that must legitimately wait longer than DefaultTimeout needs to say so here.
+// That caller is the OAuth2 device login: it waits on a human, and the bound is
+// the code's own expiry rather than an arbitrary transport timeout (spec §54).
+// A non-positive timeout leaves DefaultTimeout in place.
+func CallWithTimeout(ctx context.Context, path string, timeout time.Duration, request, response any) error {
+	client, err := DialClient(path)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+	if timeout > 0 {
+		client.Timeout = timeout
+	}
+	return client.Call(ctx, request, response)
+}
+
 // Lock is a held single-instance lock.
 type Lock struct {
 	file *os.File
