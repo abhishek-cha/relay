@@ -225,7 +225,7 @@ The parity assertions land in e2e section 11 (M8); the skill half stays open wit
 **Goal:** prove the core loop and lock it with tests.
 
 - [x] Unit — manifest: required fields, duplicate operations, invalid protocol, invalid auth — `internal/manifest/validate_test.go`, `internal/manifest/input_test.go`
-- [ ] Unit — runtime: CLI parsing, input validation, JSON output, exit codes — `internal/runtime` has no test file yet; `parseInput` and the exit-code mapping are untested
+- [x] Unit — runtime: CLI parsing, input validation, JSON output, exit codes — `internal/runtime/runtime_test.go`
 - [x] Unit — daemon: registration, invocation, IPC, registry, errors — `internal/daemon`, `internal/registry`
 - [x] Unit — protocol: REST against `httptest` — `internal/protocol/rest/rest_test.go`
 - [x] Security: unauthorized tool access, missing credentials, permission violations, credential leakage, MCP permission bypass — `internal/keychain/security_test.go`, `internal/daemon/security_test.go`, `internal/mcp/security_test.go`
