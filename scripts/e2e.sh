@@ -391,8 +391,15 @@ PY
 # name below must never reach disk (spec §32).
 check "telemetry carries no request input" "clean" "$(grep -q 'openai' "$telem" && echo leak || echo clean)"
 check "relay stats --json counts the invocations" "ok" "$("$workdir/relay" stats --json 2>/dev/null | python3 -c 'import json,sys; t=json.load(sys.stdin)["tools"].get("demo",{}); print("ok" if t.get("total",0) >= 3 and "get_repo" in t.get("operations",{}) else "bad:"+repr(t)[:90])' 2>&1)"
-check "relay stats renders the human view" "ok" "$("$workdir/relay" stats 2>/dev/null | grep -q 'get_repo' && echo ok || echo bad)"
-check "relay stats --tool filters to one tool" "ok" "$("$workdir/relay" stats --tool demo 2>/dev/null | grep -q '^demo' && echo ok || echo bad)"
+# Capture stats output before matching it. Piping straight into 'grep -q' lets
+# grep exit on its first match, which under 'set -o pipefail' kills the
+# still-writing stats process with SIGPIPE (exit 141) and reads back as "bad"
+# even though stats succeeded. That pipeline race, not a read error, is what
+# made these two checks flaky; matching a captured string has no pipe to break.
+stats_human="$("$workdir/relay" stats 2>/dev/null)"
+check "relay stats renders the human view" "ok" "$([[ "$stats_human" == *get_repo* ]] && echo ok || echo bad)"
+stats_tool="$("$workdir/relay" stats --tool demo 2>/dev/null)"
+check "relay stats --tool filters to one tool" "ok" "$([[ "$stats_tool" == demo* ]] && echo ok || echo bad)"
 
 # --- 11. MCP discovery, invocation, and CLI/MCP parity (spec §27, §28, §29) ---
 #

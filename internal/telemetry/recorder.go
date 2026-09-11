@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -210,22 +211,39 @@ func (r *Recorder) sanitize(s string) string {
 	return keychain.Redact(s, r.secrets...)
 }
 
-// ReadEvents decodes a JSONL stream back into Events. Blank lines are skipped so
-// a truncated tail cannot poison the whole read; a malformed line is an error.
+// ReadEvents decodes a JSONL stream back into Events. Blank lines are skipped.
+//
+// A complete but malformed line is an error: that is genuine corruption and
+// should be visible rather than silently dropped. The one exception is a
+// trailing fragment with no terminating newline. Record emits each event as a
+// single complete line, so an unterminated final line can only be a write that
+// is still in flight -- what a reader sees when it overlaps an append, or a
+// rotation that has just moved the file being read. Skipping that fragment lets
+// a read succeed against a live writer without hiding real damage: a malformed
+// line that is newline-terminated (so no longer the tail) still fails the read,
+// and a genuine I/O error is still returned.
 func ReadEvents(rd io.Reader) ([]Event, error) {
 	var out []Event
-	sc := bufio.NewScanner(rd)
-	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for sc.Scan() {
-		line := sc.Bytes()
-		if len(bytes.TrimSpace(line)) == 0 {
-			continue
+	br := bufio.NewReaderSize(rd, 64*1024)
+	for {
+		line, err := br.ReadBytes('\n')
+		if len(line) > 0 && line[len(line)-1] == '\n' {
+			body := line[:len(line)-1]
+			if len(bytes.TrimSpace(body)) != 0 {
+				var e Event
+				if jerr := json.Unmarshal(body, &e); jerr != nil {
+					return nil, jerr
+				}
+				out = append(out, e)
+			}
 		}
-		var e Event
-		if err := json.Unmarshal(line, &e); err != nil {
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				// An unterminated trailing fragment is a write in flight; the
+				// events before it are complete and are returned as-is.
+				return out, nil
+			}
 			return nil, err
 		}
-		out = append(out, e)
 	}
-	return out, sc.Err()
 }

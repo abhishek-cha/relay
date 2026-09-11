@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -34,6 +35,23 @@ type errorWriter struct {
 }
 
 func (w errorWriter) Write(p []byte) (int, error) { return w.n, w.err }
+
+// tornWriter writes each record in two chunks with a pause in between so a
+// concurrent reader reliably observes a file that ends mid-line. A real append
+// is usually a single write, but a reader has no guarantee of that; this models
+// the worst case the read path must tolerate.
+type tornWriter struct{ f *os.File }
+
+func (w tornWriter) Write(p []byte) (int, error) {
+	half := len(p) / 2
+	n, err := w.f.Write(p[:half])
+	if err != nil {
+		return n, err
+	}
+	time.Sleep(200 * time.Microsecond)
+	m, err := w.f.Write(p[half:])
+	return n + m, err
+}
 
 func TestEventRoundTrip(t *testing.T) {
 	ts := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
@@ -112,6 +130,72 @@ func TestConcurrentAppendsStayLineValid(t *testing.T) {
 		if e.Tool != "tool" || e.Operation != "op" {
 			t.Fatalf("line %d corrupted: %+v", i, e)
 		}
+	}
+}
+
+// TestReadEventsToleratesConcurrentAppend is the regression for the flaky
+// "relay stats" read: a reader that overlaps the writer's append must never
+// hard-fail. The writer here tears every line in half on purpose, so the reader
+// is guaranteed to observe a file ending mid-line; before ReadEvents skipped a
+// trailing fragment this failed with a JSON error on nearly every iteration.
+func TestReadEventsToleratesConcurrentAppend(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.jsonl")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer f.Close()
+
+	r := NewWriter(tornWriter{f})
+	var writer sync.WaitGroup
+	var done atomic.Bool
+	writer.Add(1)
+	go func() {
+		defer writer.Done()
+		defer done.Store(true)
+		for i := 0; i < 300; i++ {
+			if err := r.Record(Event{Tool: "demo", Operation: "get_repo", Timestamp: time.Unix(int64(i), 0).UTC(), DurationMs: 1, Success: true}); err != nil {
+				t.Errorf("Record: %v", err)
+				return
+			}
+		}
+	}()
+
+	reads := 0
+	var readErr error
+	var corrupt *Event
+	for !done.Load() {
+		rf, err := os.Open(path)
+		if err != nil {
+			readErr = err
+			break
+		}
+		events, err := ReadEvents(rf)
+		rf.Close()
+		if err != nil {
+			readErr = err
+			break
+		}
+		for i := range events {
+			if events[i].Tool != "demo" || events[i].Operation != "get_repo" {
+				corrupt = &events[i]
+				break
+			}
+		}
+		if corrupt != nil {
+			break
+		}
+		reads++
+	}
+	writer.Wait()
+	if readErr != nil {
+		t.Fatalf("ReadEvents failed against a concurrent append: %v", readErr)
+	}
+	if corrupt != nil {
+		t.Fatalf("corrupt event decoded: %+v", *corrupt)
+	}
+	if reads == 0 {
+		t.Fatal("reader never observed the file; the test did not exercise the race")
 	}
 }
 
@@ -250,6 +334,13 @@ func TestReadEvents(t *testing.T) {
 		{"blank-lines-skipped", "\n\n", 0, false},
 		{"two-events", `{"tool":"a","operation":"o","success":true}` + "\n" + `{"tool":"b","operation":"p","success":false}` + "\n", 2, false},
 		{"malformed", "{not json}\n", 0, true},
+		// A trailing fragment with no newline is a write in flight and must be
+		// skipped, leaving the complete events that precede it.
+		{"torn-trailing-line", `{"tool":"a","operation":"o","success":true}` + "\n" + `{"tool":"b","operat`, 1, false},
+		{"blank-then-torn-trailing", "\n" + `{"tool":"b","operat`, 0, false},
+		// Damage that is no longer the tail is still surfaced: the malformed
+		// line is newline-terminated, so it cannot be an in-flight append.
+		{"malformed-mid-file", `{"tool":"a","operation":"o","success":true}` + "\n" + "{not json}\n" + `{"tool":"c","operation":"q","success":true}` + "\n", 0, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
