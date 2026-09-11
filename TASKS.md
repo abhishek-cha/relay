@@ -173,15 +173,15 @@ raw so `url.Values.Encode` owns query encoding.
 **Goal:** every binary carries AI guidance and can serve it.
 
 - [x] `SKILL.md` embedded alongside the manifest at build time (§8) — `internal/build`
-- [ ] Versioned together with the manifest (§36) — the manifest carries `metadata.version`, but the skill has no version field, so a mismatch cannot fail the build yet
+- [x] Versioned together with the manifest (§36) — `internal/skill/version.go` parses an optional `version:` in leading frontmatter and `internal/build` fails the build when it disagrees with `metadata.version`
 - [x] `--skill` prints it — `internal/runtime`
-- [ ] The daemon serves the skill over IPC — the daemon records only a `Skill bool`; there is no `skill` IPC frame, so MCP cannot yet see the skill text (§29)
+- [x] The daemon serves the skill over IPC — the `skill` IPC frame runs the installed binary's `--skill` on every request, so the binary stays authoritative and nothing is cached (§29)
 - [x] Skill linter: rejects skills that restate the input schema and requires workflow guidance — `internal/skill/lint.go`
 - [x] `templates/SKILL.md` starting point
 
 **Implemented in:** `internal/skill`, `internal/build` (lint gate), `internal/runtime`.
 **Acceptance:** `github --skill` prints embedded guidance; the daemon returns identical text; a manifest/skill version mismatch fails the build.
-The first clause passes; the last two are open — see the unchecked items above.
+Every box passes: the skill is embedded, printed by `--skill`, versioned against the manifest, served over IPC, and held to the no-schema linter.
 
 ---
 
@@ -193,7 +193,7 @@ The first clause passes; the last two are open — see the unchecked items above
 - [x] Discovery: registry → tool descriptors → MCP tool list, exposing name, description, and input JSON schema
 - [x] Naming: `github_get_repository` (the flat `<tool>_<operation>` form, §28)
 - [x] Invocation: MCP call → the same daemon path as the CLI; no separate engine
-- [ ] Skill exposure to MCP consumers (§29) — blocked on the same missing `skill` IPC frame as M5; the daemon serves no skill text yet
+- [x] Skill exposure to MCP consumers (§29) — `resources/list` and `resources/read` serve `relay://skill/<tool>` through the daemon, so MCP clients see the same guidance the CLI does
 - [x] Errors use the exact same structured codes as the CLI — a missing credential returns `AUTH_REQUIRED` through both paths
 - [x] Security: MCP inherits the permission and auth path; no MCP-only credential route (§41)
 
@@ -202,7 +202,7 @@ The first clause passes; the last two are open — see the unchecked items above
 **Verified by hand:** `initialize` returns `protocolVersion` `2025-03-26`; `tools/list` includes `github_get_repository` with its `inputSchema`; a `tools/call` with no stored credential returns `result.isError: true` whose `content[0].text` carries the same `AUTH_REQUIRED` code the CLI reports; the server exits cleanly on stdin EOF.
 
 **Acceptance (§60):** the same capability returns the same result through CLI and MCP; a parity test asserts `CLI definition == MCP definition`.
-The parity assertions land in e2e section 11 (M8); the skill half stays open with §29 above.
+The parity assertions land in e2e section 11 (M8); the skill is served through the same `skill` IPC frame the CLI uses.
 
 ---
 
