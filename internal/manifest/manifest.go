@@ -125,6 +125,12 @@ type Request struct {
 	Headers map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
 	Body    any               `yaml:"body,omitempty" json:"body,omitempty"`
 
+	// Pagination declares how a REST collection operation walks its pages
+	// (spec §20). It is optional and REST-only: it is meaningful solely for a
+	// GET/HEAD that returns a page of a larger result set. Leaving it unset
+	// keeps the operation a single request, exactly as before it existed.
+	Pagination *Pagination `yaml:"pagination,omitempty" json:"pagination,omitempty"`
+
 	// Document is the GraphQL operation text (a query or mutation). It is read
 	// only when protocol.type is graphql; a REST request leaves it empty
 	// (spec §44).
@@ -141,6 +147,60 @@ type Request struct {
 	// local request names a primitive instead of an address, so it sets none of
 	// Method, Path, Query, Headers, Body, Document, or Variables.
 	Operation string `yaml:"operation,omitempty" json:"operation,omitempty"`
+}
+
+// Pagination styles understood by relay/v1 (spec §20).
+const (
+	// PaginationStyleLinkHeader follows the RFC 8288 `Link rel="next"`
+	// response header (GitHub, Stripe, most REST APIs).
+	PaginationStyleLinkHeader = "link-header"
+	// PaginationStyleCursor echoes a cursor read from the JSON response body
+	// back into a named request parameter.
+	PaginationStyleCursor = "cursor"
+)
+
+// Cursor locations a cursor-style strategy may name (spec §20).
+const (
+	// CursorInQuery carries the cursor as a query parameter.
+	CursorInQuery = "query"
+	// CursorInBody carries the cursor inside the JSON request body.
+	CursorInBody = "body"
+)
+
+// Pagination declares how one REST operation collects a multi-page result
+// (spec §20). It is a property of the operation's transport, so it lives on the
+// request block next to method and path. The manifest is machine truth: an
+// executor follows the declared strategy, and nothing here teaches an agent how
+// to page (that is SKILL.md's job, spec §7).
+//
+// Two styles exist. A link-header strategy reads the next page's URL from the
+// RFC 8288 response header and declares no cursor fields. A cursor strategy
+// reads a value out of the JSON response body (CursorField) and sends it back
+// as a request parameter (CursorParam, in CursorIn).
+type Pagination struct {
+	// Style is "link-header" or "cursor".
+	Style string `yaml:"style" json:"style"`
+
+	// CursorParam names the request parameter carrying the cursor
+	// (cursor style only).
+	CursorParam string `yaml:"cursorParam,omitempty" json:"cursorParam,omitempty"`
+
+	// CursorIn is "query" or "body" and selects where CursorParam is placed
+	// (cursor style only; an empty value defaults to "query").
+	CursorIn string `yaml:"cursorIn,omitempty" json:"cursorIn,omitempty"`
+
+	// CursorField is the dotted path within the JSON response body that holds
+	// the next cursor (cursor style only).
+	CursorField string `yaml:"cursorField,omitempty" json:"cursorField,omitempty"`
+
+	// HasMoreField is an optional dotted path to a bool or number that can stop
+	// the walk early, before the cursor runs out (cursor style only).
+	HasMoreField string `yaml:"hasMoreField,omitempty" json:"hasMoreField,omitempty"`
+
+	// LimitParam is an optional page-size request parameter; Limit is the
+	// default page size sent with it. Either style may declare them.
+	LimitParam string `yaml:"limitParam,omitempty" json:"limitParam,omitempty"`
+	Limit      int    `yaml:"limit,omitempty" json:"limit,omitempty"`
 }
 
 // Parse decodes a YAML manifest. It does not validate — call Validate.

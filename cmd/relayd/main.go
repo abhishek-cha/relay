@@ -17,11 +17,13 @@ import (
 	"path/filepath"
 	"syscall"
 
+	browsersession "relay/internal/browser"
 	"relay/internal/daemon"
 	"relay/internal/ipc"
 	"relay/internal/manifest"
 	"relay/internal/paths"
 	"relay/internal/protocol"
+	browserproto "relay/internal/protocol/browser"
 	"relay/internal/protocol/graphql"
 	"relay/internal/protocol/grpc"
 	"relay/internal/protocol/local"
@@ -101,10 +103,18 @@ func run(args []string) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// REST, GraphQL, gRPC, and local capabilities have executors (spec §20, §44,
-	// §45, §46). A manifest asking for browser is rejected with PROTOCOL_ERROR
-	// rather than guessed at, so the rejection stays honest as new executors land
-	// (spec §19).
+	// REST, GraphQL, gRPC, local, and browser capabilities have executors
+	// (spec §20, §23, §44, §45, §46). The browser executor is session-carrying
+	// but reuses the REST request shape, so only its transport differs. A
+	// protocol with no executor is still rejected with PROTOCOL_ERROR rather than
+	// guessed at, so the rejection stays honest as new executors land (spec §19).
+	//
+	// The daemon owns the session store: this constructor is the one the daemon
+	// must also use to run the session_login and session_clear frames, so a login
+	// and a later operation share one cookie jar.
+	browserSessions := browsersession.New(browsersession.Config{
+		Dir: browsersession.SessionDir(layout),
+	})
 	d := daemon.New(daemon.Config{
 		Layout:    layout,
 		Version:   version,
@@ -116,6 +126,7 @@ func run(args []string) int {
 			"graphql": graphql.New(),
 			"grpc":    grpc.New(),
 			"local":   local.New(),
+			"browser": browserproto.New(browserSessions),
 		},
 	})
 

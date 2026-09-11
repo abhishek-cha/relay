@@ -833,7 +833,25 @@ Support:
 * Headers
 * JSON bodies
 * JSON responses
-* Pagination
+* Pagination — an optional `pagination:` block on `request:` declares how a
+  collection operation walks its pages. Two strategies exist:
+  * `link-header` — follow the RFC 8288 `Link rel="next"` response header
+    (GitHub, Stripe, most REST APIs).
+  * `cursor` — echo a value read from the JSON response body back into a named
+    request parameter, with an optional has-more field.
+
+  Example:
+
+  request:
+    method: GET
+    path: /repos/{owner}/{repo}/pulls
+    pagination:
+      style: link-header
+
+  Only GET and HEAD may declare one. Following pages is opt-in and turned on by
+  the caller; a walk is bounded by a maximum page count and a maximum total
+  response size, and a partial result is reported as truncated rather than
+  passed off as a single page.
 * Authentication
 * Error handling
 
@@ -916,17 +934,19 @@ The daemon should inject credentials at execution time.
 
 Some services cannot be cleanly represented as APIs.
 
-Relay should eventually provide shared browser/session capabilities.
+Relay provides a shared session layer, rather than a browser runtime per tool: a
+browser tool is an HTTP tool whose requests carry cookies the daemon obtained by
+logging in.
 
 Example:
 
 Relay Browser
     │
-    ├── Login
-    ├── Cookies
-    ├── Sessions
-    ├── OAuth
-    └── Web interaction
+    ├── Login            form POST, or a bearer/header login
+    ├── Cookies          per-tool cookie jar, persisted under the Relay home
+    ├── Sessions         explicit login and clear over IPC
+    ├── OAuth            device flow lives in auth (spec 21); redirect login is not yet
+    └── Web interaction  HTTP only; no JavaScript execution
 
 This allows future tools to declare:
 
@@ -934,6 +954,34 @@ protocol:
   type: browser
 
 without creating a separate browser runtime per tool.
+
+The executor is built on net/http plus net/http/cookiejar. JavaScript-heavy
+interaction — running page scripts, driving a DOM, following a rendered
+navigation — is deliberately out of scope until a real browser engine lands. An
+honest session layer that logs in and reuses cookies is more useful than a
+stubbed engine, and it fills the same protocol.Executor seam a future engine
+would attach to.
+
+A browser tool declares its login flow additively under auth.login, keeping the
+auth.type from the existing vocabulary:
+
+protocol:
+  type: browser
+  baseUrl: https://api.example.com
+auth:
+  type: basic            # basic -> user:password; bearer/api_key -> token
+  login:
+    kind: form           # form | header
+    path: /session
+    usernameField: user
+    passwordField: pass
+
+Operations carry the same request shape REST uses (method, path, query, headers,
+body), so only the transport differs and neither the CLI nor MCP changes
+(spec 19). The daemon owns the session: cookies are written under the Relay home
+and never cross IPC, appear in a log, or reach telemetry. An operation with no
+session fails AUTH_REQUIRED, and the client refuses to follow a redirect to a
+different host so a cookie is never replayed to another origin (spec 22, 40).
 
 ⸻
 

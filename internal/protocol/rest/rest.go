@@ -31,6 +31,16 @@ const defaultRetryBase = 500 * time.Millisecond
 // maxRetryAfter caps Retry-After durations to avoid blocking indefinitely.
 const maxRetryAfter = 30 * time.Second
 
+// defaultMaxPages bounds how many pages a single paginated operation follows,
+// so a backend that always offers a next page cannot spin forever (spec §20).
+const defaultMaxPages = 100
+
+// defaultMaxTotalBytes bounds the total response bytes a single paginated
+// operation buffers, so a hostile or runaway backend cannot exhaust memory
+// (spec §20, §40). It is deliberately larger than maxResponseBodyBytes because
+// it spans many individually-bounded pages.
+const defaultMaxTotalBytes = 64 << 20 // 64 MiB
+
 // Sleeper is a function that pauses execution for the given duration.
 // Tests inject a no-op sleeper to avoid real sleeps.
 type Sleeper func(d time.Duration)
@@ -49,6 +59,14 @@ type Executor struct {
 	// initial request) for retryable requests. Defaults to
 	// maxRetryAttempts (3) when zero.
 	MaxAttempts int
+
+	// MaxPages is the maximum number of pages a paginated operation follows.
+	// Defaults to defaultMaxPages (100) when zero.
+	MaxPages int
+
+	// MaxTotalBytes is the maximum total response bytes a paginated operation
+	// buffers. Defaults to defaultMaxTotalBytes (64 MiB) when zero.
+	MaxTotalBytes int64
 }
 
 // New returns an Executor with sensible defaults.
@@ -58,7 +76,9 @@ func New() *Executor {
 		Sleeper: func(d time.Duration) {
 			time.Sleep(d)
 		},
-		MaxAttempts: maxRetryAttempts,
+		MaxAttempts:   maxRetryAttempts,
+		MaxPages:      defaultMaxPages,
+		MaxTotalBytes: defaultMaxTotalBytes,
 	}
 }
 
@@ -165,26 +185,45 @@ func (e *Executor) Execute(ctx context.Context, req protocol.Request) (protocol.
 		applyCredential(headers, req.Credential)
 	}
 
-	// Execute with retries for idempotent methods on 429/5xx.
+	// Page-following is opt-in and needs a declared strategy. Without both, the
+	// operation is exactly one request and behaves byte-for-byte as it always
+	// has: same URL, same headers, same body, same retries, same errors.
+	if !req.Paginate || spec.Pagination == nil {
+		resp, _, err := e.executeWithRetry(ctx, method, resolvedURL.String(), headers, bodyBytes)
+		if err != nil {
+			return protocol.Response{}, err
+		}
+		resp.Pages = 1
+		return resp, nil
+	}
+
+	return e.executePaginated(ctx, method, resolvedURL, headers, bodyBytes, spec.Pagination)
+}
+
+// executeWithRetry performs one request with the idempotent retry policy and
+// returns the normalized response plus the number of response body bytes that
+// were buffered. Paginated execution uses the byte count to enforce its total
+// size cap; a single request ignores it.
+func (e *Executor) executeWithRetry(ctx context.Context, method, rawURL string, headers http.Header, bodyBytes []byte) (protocol.Response, int, error) {
 	maxAttempts := e.effectiveMaxAttempts()
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		resp, err := e.doRequest(ctx, method, resolvedURL.String(), headers, bodyBytes)
+		resp, err := e.doRequest(ctx, method, rawURL, headers, bodyBytes)
 		if err != nil {
 			if ctx.Err() != nil {
-				return protocol.Response{}, relay.NewError(
+				return protocol.Response{}, 0, relay.NewError(
 					relay.CodeTimeout,
 					"context deadline exceeded or cancelled",
 				).WithDetails(map[string]any{
 					"method": method,
-					"url":    resolvedURL.String(),
+					"url":    rawURL,
 				})
 			}
-			return protocol.Response{}, relay.NewError(
+			return protocol.Response{}, 0, relay.NewError(
 				relay.CodeNetworkError,
 				"transport error: "+err.Error(),
 			).WithDetails(map[string]any{
 				"method": method,
-				"url":    resolvedURL.String(),
+				"url":    rawURL,
 			})
 		}
 
@@ -198,16 +237,16 @@ func (e *Executor) Execute(ctx context.Context, req protocol.Request) (protocol.
 		}
 
 		defer resp.Body.Close()
-		return readAndMapResponse(resp, method, resolvedURL.String())
+		return readAndMapResponse(resp, method, rawURL)
 	}
 
 	// Should not be reached — the last iteration always returns.
-	return protocol.Response{}, relay.NewError(
+	return protocol.Response{}, 0, relay.NewError(
 		relay.CodeRemoteError,
 		"exhausted retries",
 	).WithDetails(map[string]any{
 		"method": method,
-		"url":    resolvedURL.String(),
+		"url":    rawURL,
 	})
 }
 
@@ -220,6 +259,20 @@ func (e *Executor) effectiveMaxAttempts() int {
 		return e.MaxAttempts
 	}
 	return maxRetryAttempts
+}
+
+func (e *Executor) effectiveMaxPages() int {
+	if e.MaxPages > 0 {
+		return e.MaxPages
+	}
+	return defaultMaxPages
+}
+
+func (e *Executor) effectiveMaxTotalBytes() int64 {
+	if e.MaxTotalBytes > 0 {
+		return e.MaxTotalBytes
+	}
+	return defaultMaxTotalBytes
 }
 
 func (e *Executor) sleep(d time.Duration) {
@@ -387,11 +440,11 @@ func applyCredential(headers http.Header, cred *protocol.Credential) {
 // Response handling
 // ---------------------------------------------------------------------------
 
-func readAndMapResponse(resp *http.Response, method, resolvedURL string) (protocol.Response, error) {
+func readAndMapResponse(resp *http.Response, method, resolvedURL string) (protocol.Response, int, error) {
 	limitedReader := io.LimitReader(resp.Body, maxResponseBodyBytes+1)
 	bodyBytes, err := io.ReadAll(limitedReader)
 	if err != nil {
-		return protocol.Response{}, relay.NewError(
+		return protocol.Response{}, 0, relay.NewError(
 			relay.CodeNetworkError,
 			"failed to read response body",
 		).WithDetails(map[string]any{
@@ -401,7 +454,7 @@ func readAndMapResponse(resp *http.Response, method, resolvedURL string) (protoc
 		})
 	}
 	if int64(len(bodyBytes)) > maxResponseBodyBytes {
-		return protocol.Response{}, relay.NewError(
+		return protocol.Response{}, 0, relay.NewError(
 			relay.CodeRemoteError,
 			"response body exceeds maximum allowed size",
 		).WithDetails(map[string]any{
@@ -421,19 +474,20 @@ func readAndMapResponse(resp *http.Response, method, resolvedURL string) (protoc
 		Status:  resp.StatusCode,
 		Headers: responseHeaders,
 	}
+	size := len(bodyBytes)
 
 	// Parse JSON when Content-Type indicates JSON.
 	if isJSONContentType(resp.Header.Get("Content-Type")) {
 		var jsonBody any
 		if err := json.Unmarshal(bodyBytes, &jsonBody); err == nil {
 			result.Body = jsonBody
-			return result, mapHTTPStatus(resp.StatusCode, method, resolvedURL)
+			return result, size, mapHTTPStatus(resp.StatusCode, method, resolvedURL)
 		}
 	}
 
 	// Non-JSON or malformed JSON: return raw string.
 	result.Body = string(bodyBytes)
-	return result, mapHTTPStatus(resp.StatusCode, method, resolvedURL)
+	return result, size, mapHTTPStatus(resp.StatusCode, method, resolvedURL)
 }
 
 func isJSONContentType(ct string) bool {

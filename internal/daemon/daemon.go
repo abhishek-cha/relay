@@ -47,8 +47,10 @@ type Config struct {
 	// DestructiveOps names the operations that require explicit confirmation
 	// before they run (spec §25). It is daemon configuration because the manifest
 	// schema has no field for destructiveness, so a tool cannot widen its own
-	// confirmation surface by editing its manifest. Empty means no operation is
-	// gated, which is the default: behavior is unchanged until this is set.
+	// confirmation surface by editing its manifest. A nil slice means "read
+	// permissions.yaml" (falling back to DefaultDestructiveOps when the file is
+	// absent), while a non-nil slice overrides the file outright — including an
+	// explicitly empty slice, which gates nothing. See resolveDestructiveOps.
 	DestructiveOps []string
 	// Now is the clock, injectable so uptime and install timestamps are testable.
 	Now func() time.Time
@@ -69,6 +71,7 @@ type Daemon struct {
 	executors      map[string]protocol.Executor
 	toolTimeout    time.Duration
 	destructiveOps []string
+	configErr      error
 	now            func() time.Time
 	started        time.Time
 	socket         string
@@ -103,6 +106,16 @@ func New(cfg Config) *Daemon {
 	if keychainStore == nil {
 		keychainStore = &keychain.SecurityStore{}
 	}
+	// The destructive list comes from daemon configuration, not the manifest, so
+	// a tool cannot widen its own confirmation surface (spec §25). A malformed
+	// policy file is a hard error: the daemon refuses to start rather than run
+	// with a list the operator did not intend. The fallback here is the default
+	// list, so even the error path is fail-closed for a caller that invokes the
+	// daemon directly without Run.
+	destructiveOps, configErr := resolveDestructiveOps(cfg.Layout.Config, cfg.DestructiveOps)
+	if configErr != nil {
+		destructiveOps = append([]string(nil), DefaultDestructiveOps...)
+	}
 	return &Daemon{
 		layout:         cfg.Layout,
 		version:        cfg.Version,
@@ -111,7 +124,8 @@ func New(cfg Config) *Daemon {
 		usage:          cfg.Telemetry,
 		executors:      executors,
 		toolTimeout:    timeout,
-		destructiveOps: append([]string(nil), cfg.DestructiveOps...),
+		destructiveOps: destructiveOps,
+		configErr:      configErr,
 		now:            now,
 		started:        now(),
 		socket:         socket,
@@ -144,11 +158,16 @@ func (d *Daemon) Handle(ctx context.Context, kind string, frame []byte) (any, er
 		return d.hello(request), nil
 
 	case relay.FrameInvoke:
-		var request relay.InvokeRequest
+		// Every invoke is decoded through ipc.InvokeFrame so the optional
+		// confirmation acknowledgment is read from the same frame. A plain
+		// relay.InvokeRequest (what a tool binary and the MCP adapter send)
+		// decodes to an empty Confirmation and is never treated as confirmed
+		// (spec §41).
+		var request ipc.InvokeFrame
 		if failure := decode(frame, &request); failure != nil {
 			return relay.InvokeResponse{Success: false, Error: failure}, nil
 		}
-		return d.invoke(ctx, request), nil
+		return d.invokeWith(ctx, request.InvokeRequest, request.Confirmation), nil
 
 	case relay.FrameList:
 		return d.list(), nil
@@ -257,14 +276,33 @@ func (d *Daemon) hello(request relay.HelloRequest) relay.HelloResponse {
 	return response
 }
 
-// invoke executes one declared operation.
+// invoke executes one declared operation with no confirmation. It is the
+// unconfirmed seam the unit tests drive directly; the IPC surface goes through
+// invokeWith so a frame's acknowledgement is honored (spec §25).
+func (d *Daemon) invoke(ctx context.Context, request relay.InvokeRequest) relay.InvokeResponse {
+	return d.invokeWith(ctx, request, "")
+}
+
+// invokeWith executes one declared operation, resolving the destructive gate
+// with confirmation when the caller supplied it (spec §25).
 //
 // The order matters: the tool must be registered, its manifest must be readable
 // and compatible, the operation must exist, and the input must validate before
 // any network traffic happens. The permission boundary then runs before the
 // credential is read and before protocol dispatch (spec §18). That way a caller
 // gets a precise error instead of a confusing remote failure (spec §18, §26).
-func (d *Daemon) invokeOperation(ctx context.Context, request relay.InvokeRequest) relay.InvokeResponse {
+func (d *Daemon) invokeWith(ctx context.Context, request relay.InvokeRequest, confirmation string) relay.InvokeResponse {
+	started := d.now()
+	response := d.invokeOperation(ctx, request, confirmation)
+	d.recordUsage(request, response, d.now().Sub(started))
+	return response
+}
+
+// invokeOperation runs the ordered pre-flight checks and then dispatches to the
+// protocol executor. confirmation is the caller's explicit acknowledgment of a
+// destructive operation; it resolves only the destructive gate and never an
+// entitlement denial (spec §25, §40).
+func (d *Daemon) invokeOperation(ctx context.Context, request relay.InvokeRequest, confirmation string) relay.InvokeResponse {
 	installation, err := d.store.Get(request.Tool)
 	if err != nil {
 		return invokeFailure(unknownTool(err, request.Tool))
@@ -294,7 +332,7 @@ func (d *Daemon) invokeOperation(ctx context.Context, request relay.InvokeReques
 	// manifest is not entitled to run is refused here, so no secret leaves the
 	// Keychain and no request leaves the daemon on its behalf. This sits inside
 	// the timed invoke, so a denied call is still recorded as usage (spec §31).
-	if failure := d.permissionCheck(doc, operation, request.Input); failure != nil {
+	if failure := d.permissionCheck(doc, request.Tool, operation, request.Input, confirmation); failure != nil {
 		return invokeFailure(failure)
 	}
 
@@ -335,19 +373,6 @@ func (d *Daemon) invokeOperation(ctx context.Context, request relay.InvokeReques
 	}
 
 	return relay.InvokeResponse{Success: true, Result: response.Body}
-}
-
-// invoke answers one invocation and records a local usage event for it
-// (spec §31).
-//
-// The event is recorded for failures as well as successes, because the failure
-// rate and the error code are the two things a summary is most useful for: an
-// agent repeatedly hitting AUTH_REQUIRED is a workflow problem worth seeing.
-func (d *Daemon) invoke(ctx context.Context, request relay.InvokeRequest) relay.InvokeResponse {
-	started := d.now()
-	response := d.invokeOperation(ctx, request)
-	d.recordUsage(request, response, d.now().Sub(started))
-	return response
 }
 
 // credential resolves the secret to inject at execution time (spec §21, §22).

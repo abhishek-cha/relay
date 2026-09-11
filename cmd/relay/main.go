@@ -26,6 +26,7 @@ import (
 	"relay/internal/ipc"
 	"relay/internal/mcp"
 	"relay/internal/paths"
+	"relay/internal/permissions"
 	"relay/internal/registry"
 	"relay/internal/sign"
 	"relay/internal/telemetry"
@@ -50,6 +51,7 @@ Commands:
   sign      Sign a built tool binary so install can verify it
   list      List registered tools
   inspect   Show a registered tool's descriptor
+  run       Run one tool operation through the daemon
   daemon    Manage the Relay daemon (start|stop|restart|status|install)
   logs      Show daemon logs
   mcp       Run the MCP server
@@ -90,6 +92,8 @@ func run(args []string) int {
 		return runList(args[1:])
 	case "inspect":
 		return runInspect(args[1:])
+	case "run":
+		return runRun(args[1:])
 	case "daemon":
 		return runDaemon(args[1:])
 	case "logs":
@@ -510,6 +514,157 @@ func runInspect(args []string) int {
 	}
 
 	return 0
+}
+
+// runRun executes one tool operation through the daemon (spec §14, §25).
+//
+// It is the CLI's one invocation surface, and so the one place a human can
+// answer the daemon's destructive-operation gate. The gate is never bypassed:
+// the first call carries no acknowledgement, the daemon refuses a destructive
+// operation with a distinct CONFIRMATION_REQUIRED outcome, and this command
+// re-issues the identical call with an acknowledgement only after reading a yes
+// from an interactive terminal. A non-interactive stdin is never treated as
+// consent, so a script cannot confirm on a human's behalf (spec §25).
+func runRun(args []string) int {
+	flags := flag.NewFlagSet("relay run", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	flags.Usage = func() {
+		fmt.Fprint(os.Stderr, "usage: relay run <tool> <operation> [--input JSON]\n")
+		flags.PrintDefaults()
+	}
+	inputJSON := flags.String("input", "", "operation input as a JSON object")
+
+	if err := flags.Parse(permute(flags, args)); err != nil {
+		return 2
+	}
+	if flags.NArg() != 2 {
+		flags.Usage()
+		return 2
+	}
+	tool, operation := flags.Arg(0), flags.Arg(1)
+
+	input := map[string]any{}
+	if *inputJSON != "" {
+		if err := json.Unmarshal([]byte(*inputJSON), &input); err != nil {
+			fmt.Fprintf(os.Stderr, "relay: --input is not a JSON object: %v\n", err)
+			return 2
+		}
+	}
+
+	// The first call is unconfirmed by construction: Confirmation is the zero
+	// value, so the wire shape is exactly what a tool binary always sent.
+	response, code := callInvoke(ipc.InvokeFrame{InvokeRequest: relay.InvokeRequest{
+		Type: relay.FrameInvoke, Tool: tool, Operation: operation, Input: input,
+	}})
+	if code != 0 {
+		return code
+	}
+	if response.Success {
+		return printResult(response.Result)
+	}
+	if confirmationRequired(response.Error) {
+		return confirmRun(tool, operation, input, response.Error)
+	}
+	return reportResponseError(response.Error, "run operation")
+}
+
+// confirmationRequired reports whether a structured error is the daemon's
+// destructive-operation gate rather than a plain refusal (spec §25).
+func confirmationRequired(structured *relay.Error) bool {
+	return structured != nil && structured.Code == permissions.CodeConfirmationRequired
+}
+
+// confirmRun asks the human to approve one gated operation and, on a yes,
+// re-issues the call with the acknowledgement the daemon expects.
+//
+// The prompt is only reached on an interactive terminal. A piped or closed
+// stdin leaves the daemon's denial in place, which is the only safe default: a
+// confirmation is an act of a present human, not something a caller can assert
+// for one (spec §25). The acknowledgement is rebuilt here and never persisted;
+// it is not a credential and carries no information the caller did not already
+// state.
+func confirmRun(tool, operation string, input map[string]any, gate *relay.Error) int {
+	if !stdinIsTerminal() {
+		fmt.Fprintln(os.Stderr, "relay: stdin is not a terminal; cannot confirm on the terminal")
+		return reportResponseError(gate, "run operation")
+	}
+	fmt.Fprintf(os.Stderr, "%s\nAllow? [y/N] ", gate.Message)
+	approved, err := confirmedByHuman(os.Stdin)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "relay: %v\n", err)
+		return 1
+	}
+	if !approved {
+		fmt.Fprintln(os.Stderr, "relay: not confirmed")
+		return 1
+	}
+
+	confirmed := ipc.InvokeFrame{
+		InvokeRequest: relay.InvokeRequest{
+			Type: relay.FrameInvoke, Tool: tool, Operation: operation, Input: input,
+		},
+		Confirmation: ipc.ConfirmationToken(tool, operation),
+	}
+	response, code := callInvoke(confirmed)
+	if code != 0 {
+		return code
+	}
+	if !response.Success {
+		return reportResponseError(response.Error, "run operation")
+	}
+	return printResult(response.Result)
+}
+
+// callInvoke sends one invoke frame to the daemon and returns its reply.
+func callInvoke(frame ipc.InvokeFrame) (relay.InvokeResponse, int) {
+	var response relay.InvokeResponse
+	if err := ipc.Call(context.Background(), paths.Default().Socket(), &frame, &response); err != nil {
+		return response, reportIPCError(err)
+	}
+	return response, 0
+}
+
+// printResult writes a successful invocation's result to stdout as compact
+// JSON, the machine-readable half of the CLI contract (spec §10).
+func printResult(result any) int {
+	if result == nil {
+		fmt.Println("null")
+		return 0
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "relay: encode result: %v\n", err)
+		return 1
+	}
+	fmt.Println(string(encoded))
+	return 0
+}
+
+// confirmedByHuman reads one line and reports whether it is an affirmative
+// answer. Anything other than y/yes — including end of input — is a no, so the
+// default is refusal.
+func confirmedByHuman(stdin io.Reader) (bool, error) {
+	line, err := bufio.NewReader(stdin).ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return false, err
+	}
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "y", "yes":
+		return true, nil
+	default:
+		return false, nil
+	}
+}
+
+// stdinIsTerminal reports whether stdin is an interactive terminal. The
+// confirmation prompt is gated on this so a non-interactive caller is never
+// mistaken for a present human.
+func stdinIsTerminal() bool {
+	info, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
 }
 
 // ─── daemon ─────────────────────────────────────────────────────────────────

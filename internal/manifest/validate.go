@@ -140,10 +140,80 @@ func validateRequest(where, protocolType string, tool Tool, add func(string, ...
 	switch protocolType {
 	case "graphql":
 		validateGraphQLRequest(where, tool, add)
+		rejectPagination("graphql", where, tool, add)
 	case "local":
 		validateLocalRequest(where, tool, add)
+		rejectPagination("local", where, tool, add)
 	default:
 		validateRESTRequest(where, tool, add)
+		validatePagination(where, tool, add)
+	}
+}
+
+// rejectPagination refuses a pagination block on a protocol that cannot act on
+// it (spec §20). Pagination describes walking a REST collection by following a
+// Link header or echoing a cursor; a GraphQL document returns one response and a
+// local capability has no service to page, so the block would be a declaration
+// nothing honours. It is rejected rather than ignored so a manifest cannot
+// appear to page when it does not.
+func rejectPagination(protocolType, where string, tool Tool, add func(string, ...any)) {
+	if tool.Request.Pagination != nil {
+		add("%s.request.pagination: not allowed for %s; pagination is a REST strategy", where, protocolType)
+	}
+}
+
+// validatePagination checks a REST pagination block (spec §20). Every field is
+// scoped to a style: a cursor strategy needs a parameter and a response field to
+// carry the cursor, while a link-header strategy derives its cursor from the
+// response header and so must not declare fields it will never read.
+func validatePagination(where string, tool Tool, add func(string, ...any)) {
+	p := tool.Request.Pagination
+	if p == nil {
+		return
+	}
+
+	if tool.Request.Method != "" {
+		method := strings.ToUpper(tool.Request.Method)
+		if method != "GET" && method != "HEAD" {
+			add("%s.request.pagination: not allowed for method %s; pagination walks a GET or HEAD collection", where, method)
+		}
+	}
+
+	switch p.Style {
+	case "":
+		add("%s.request.pagination.style: required (%s or %s)", where, PaginationStyleLinkHeader, PaginationStyleCursor)
+	case PaginationStyleLinkHeader:
+		if p.CursorParam != "" {
+			add("%s.request.pagination.cursorParam: not allowed for link-header", where)
+		}
+		if p.CursorIn != "" {
+			add("%s.request.pagination.cursorIn: not allowed for link-header", where)
+		}
+		if p.CursorField != "" {
+			add("%s.request.pagination.cursorField: not allowed for link-header", where)
+		}
+		if p.HasMoreField != "" {
+			add("%s.request.pagination.hasMoreField: not allowed for link-header", where)
+		}
+	case PaginationStyleCursor:
+		if p.CursorParam == "" {
+			add("%s.request.pagination.cursorParam: required for cursor", where)
+		}
+		if p.CursorField == "" {
+			add("%s.request.pagination.cursorField: required for cursor", where)
+		}
+		if p.CursorIn != "" && p.CursorIn != CursorInQuery && p.CursorIn != CursorInBody {
+			add("%s.request.pagination.cursorIn: %q must be %s or %s", where, p.CursorIn, CursorInQuery, CursorInBody)
+		}
+	default:
+		add("%s.request.pagination.style: unknown style %q", where, p.Style)
+	}
+
+	if p.Limit < 0 {
+		add("%s.request.pagination.limit: %d must not be negative", where, p.Limit)
+	}
+	if p.Limit > 0 && p.LimitParam == "" {
+		add("%s.request.pagination.limit: requires limitParam", where)
 	}
 }
 

@@ -19,6 +19,13 @@ import (
 // Signal handling deliberately lives in cmd/relayd. This function only serves
 // until its context ends, which keeps it testable.
 func (d *Daemon) Run(ctx context.Context, ready func(socket string)) error {
+	// A malformed permissions policy is a hard error: the daemon refuses to serve
+	// rather than enforce a destructive list other than the one the operator
+	// wrote (spec §25). The check runs before the Relay home is touched, so a
+	// misconfigured daemon neither binds the socket nor takes the lock.
+	if d.configErr != nil {
+		return d.configErr
+	}
 	if err := d.layout.Ensure(); err != nil {
 		return err
 	}

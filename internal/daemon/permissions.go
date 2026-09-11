@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/url"
 
+	"relay/internal/ipc"
 	"relay/internal/manifest"
 	"relay/internal/permissions"
 	"relay/internal/protocol/local"
@@ -20,17 +21,20 @@ import (
 // pure classification in internal/permissions; this function only derives the
 // invocation from the manifest and frames the result.
 //
-// A denial is returned exactly as internal/permissions built it, so the CLI and
-// MCP surface the identical PERMISSION_DENIED error rather than a reworded
-// copy. A destructive operation that is otherwise entitled is turned into a
-// PERMISSION_DENIED error that says confirmation is required; there is no
-// interactive prompt yet, so the call is refused rather than run.
+// A plain denial is returned exactly as internal/permissions built it, so the
+// CLI and MCP surface the identical PERMISSION_DENIED error rather than a
+// reworded copy. A destructive operation that is otherwise entitled is returned
+// as a distinct [permissions.CodeConfirmationRequired] error naming the tool and
+// the operation, unless the caller echoed the acknowledgement for exactly that
+// tool and operation (spec §25). The daemon never prompts: it reports the gate
+// and the surface decides whether a human is asked, which is what keeps the MCP
+// adapter from ever gaining a confirmation path of its own (spec §41).
 //
 // Deriving the invocation can itself fail — a local operation naming a
 // primitive this build does not implement, or a target that cannot be resolved
 // to an absolute path. That error is returned as-is: an invocation the daemon
 // cannot classify is refused rather than run unchecked.
-func (d *Daemon) permissionCheck(doc *manifest.Document, operation *manifest.Tool, input map[string]any) *relay.Error {
+func (d *Daemon) permissionCheck(doc *manifest.Document, tool string, operation *manifest.Tool, input map[string]any, confirmation string) *relay.Error {
 	invocation, failure := permissionInvocation(doc, operation, input)
 	if failure != nil {
 		return failure
@@ -41,16 +45,25 @@ func (d *Daemon) permissionCheck(doc *manifest.Document, operation *manifest.Too
 	// a symlink matches the absolute path the request carries (spec §25, §40).
 	policy.Filesystem.Read = local.ResolveScopes(policy.Filesystem.Read)
 	policy.Filesystem.Write = local.ResolveScopes(policy.Filesystem.Write)
-	failure = permissions.Check(policy, invocation)
-	if failure == nil {
+	decision := permissions.Classify(policy, invocation)
+	if !decision.Confirmation {
+		// Either allowed (Err is nil) or a plain entitlement denial, surfaced
+		// unchanged so every surface reports the identical error.
+		return decision.Err
+	}
+	// The operation is entitled but destructive. A matching acknowledgement runs
+	// it; anything else — including the empty acknowledgement a tool binary or an
+	// MCP client sends — is refused with the gate, naming what needs confirming.
+	if ipc.Confirms(confirmation, tool, operation.Name) {
 		return nil
 	}
-	if failure.Code == permissions.CodeConfirmationRequired {
-		return relay.NewError(relay.CodePermissionDenied,
-			fmt.Sprintf("operation %q requires confirmation before it can run", operation.Name)).
-			WithDetails(failure.Details)
-	}
-	return failure
+	return relay.NewError(permissions.CodeConfirmationRequired,
+		fmt.Sprintf("operation %q on tool %q is destructive and requires confirmation", operation.Name, tool)).
+		WithDetails(map[string]any{
+			"tool":        tool,
+			"operation":   operation.Name,
+			"destructive": true,
+		})
 }
 
 // permissionInvocation states, in capability terms, what this operation is

@@ -30,6 +30,13 @@ type Request struct {
 
 	// Spec is the operation's resolved transport description.
 	Spec Spec
+
+	// Paginate turns on page-following for a REST operation whose manifest
+	// declared a pagination strategy (spec §20). It is opt-in: the daemon sets
+	// it from the caller's request, so a declared strategy is inert until a
+	// caller asks for the whole collection. It has no effect when Spec.Pagination
+	// is nil.
+	Paginate bool
 }
 
 // Spec is the transport-neutral projection of a manifest request block.
@@ -49,6 +56,25 @@ type Spec struct {
 	// so a REST spec is unchanged.
 	Document  string
 	Variables map[string]string
+
+	// Pagination is the manifest's declared page-following strategy (spec §20).
+	// It is set only for the protocol that declared one and stays nil for every
+	// other operation, so an operation without pagination executes exactly as a
+	// single request.
+	Pagination *Pagination
+}
+
+// Pagination is the transport-neutral projection of a manifest pagination
+// block (spec §20). Style is "link-header" or "cursor"; the remaining fields
+// carry meaning only for the style that reads them, matching the manifest.
+type Pagination struct {
+	Style        string
+	CursorParam  string
+	CursorIn     string
+	CursorField  string
+	HasMoreField string
+	LimitParam   string
+	Limit        int
 }
 
 // Credential is a resolved secret plus how to present it. Keep the secret
@@ -65,4 +91,12 @@ type Response struct {
 	Status  int
 	Headers map[string][]string
 	Body    any
+
+	// Pages is the number of backend pages a paginated operation collected. A
+	// single-request operation reports 1. Truncated is true when page-following
+	// stopped at an executor cap while the backend still offered a next page, so
+	// a caller can tell a complete collection from a partial one rather than
+	// reading a bounded walk as the whole result (spec §20).
+	Pages     int
+	Truncated bool
 }
