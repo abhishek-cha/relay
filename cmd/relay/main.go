@@ -56,6 +56,7 @@ Commands:
   logs      Show daemon logs
   mcp       Run the MCP server
   auth      Manage tool credentials
+  session   Manage a browser tool's session (login|clear)
   stats     Show local usage statistics
   version   Print the Relay version
 
@@ -102,6 +103,8 @@ func run(args []string) int {
 		return runMCP(args[1:])
 	case "auth":
 		return runAuth(args[1:])
+	case "session":
+		return runSession(args[1:])
 	case "stats":
 		return runStats(args[1:])
 	default:
@@ -529,10 +532,11 @@ func runRun(args []string) int {
 	flags := flag.NewFlagSet("relay run", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
 	flags.Usage = func() {
-		fmt.Fprint(os.Stderr, "usage: relay run <tool> <operation> [--input JSON]\n")
+		fmt.Fprint(os.Stderr, "usage: relay run <tool> <operation> [--input JSON] [--paginate]\n")
 		flags.PrintDefaults()
 	}
 	inputJSON := flags.String("input", "", "operation input as a JSON object")
+	paginate := flags.Bool("paginate", false, "follow the operation's declared pages and collect the whole result")
 
 	if err := flags.Parse(permute(flags, args)); err != nil {
 		return 2
@@ -554,18 +558,39 @@ func runRun(args []string) int {
 	// The first call is unconfirmed by construction: Confirmation is the zero
 	// value, so the wire shape is exactly what a tool binary always sent.
 	response, code := callInvoke(ipc.InvokeFrame{InvokeRequest: relay.InvokeRequest{
-		Type: relay.FrameInvoke, Tool: tool, Operation: operation, Input: input,
+		Type: relay.FrameInvoke, Tool: tool, Operation: operation, Input: input, Paginate: *paginate,
 	}})
 	if code != 0 {
 		return code
 	}
 	if response.Success {
+		reportPagination(response)
 		return printResult(response.Result)
 	}
 	if confirmationRequired(response.Error) {
-		return confirmRun(tool, operation, input, response.Error)
+		return confirmRun(tool, operation, input, response.Error, *paginate)
 	}
 	return reportResponseError(response.Error, "run operation")
+}
+
+// reportPagination writes a paginated walk's shape to stderr, leaving stdout as
+// the machine result alone (spec §10, §20). It is silent for an ordinary
+// invocation, so a single-page run emits nothing extra, and it names a
+// truncated walk explicitly so a bounded result is never read as complete.
+func reportPagination(response relay.InvokeResponse) {
+	if response.Pages <= 0 {
+		return
+	}
+	unit := "pages"
+	if response.Pages == 1 {
+		unit = "page"
+	}
+	if response.Truncated {
+		fmt.Fprintf(os.Stderr, "relay: collected %d %s; the result is truncated and may be incomplete\n",
+			response.Pages, unit)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "relay: collected %d %s\n", response.Pages, unit)
 }
 
 // confirmationRequired reports whether a structured error is the daemon's
@@ -583,7 +608,7 @@ func confirmationRequired(structured *relay.Error) bool {
 // for one (spec §25). The acknowledgement is rebuilt here and never persisted;
 // it is not a credential and carries no information the caller did not already
 // state.
-func confirmRun(tool, operation string, input map[string]any, gate *relay.Error) int {
+func confirmRun(tool, operation string, input map[string]any, gate *relay.Error, paginate bool) int {
 	if !stdinIsTerminal() {
 		fmt.Fprintln(os.Stderr, "relay: stdin is not a terminal; cannot confirm on the terminal")
 		return reportResponseError(gate, "run operation")
@@ -601,7 +626,7 @@ func confirmRun(tool, operation string, input map[string]any, gate *relay.Error)
 
 	confirmed := ipc.InvokeFrame{
 		InvokeRequest: relay.InvokeRequest{
-			Type: relay.FrameInvoke, Tool: tool, Operation: operation, Input: input,
+			Type: relay.FrameInvoke, Tool: tool, Operation: operation, Input: input, Paginate: paginate,
 		},
 		Confirmation: ipc.ConfirmationToken(tool, operation),
 	}
@@ -612,6 +637,7 @@ func confirmRun(tool, operation string, input map[string]any, gate *relay.Error)
 	if !response.Success {
 		return reportResponseError(response.Error, "run operation")
 	}
+	reportPagination(response)
 	return printResult(response.Result)
 }
 
@@ -1448,6 +1474,83 @@ func authStatus(tool string) (relay.AuthStatusResponse, int) {
 		return resp, reportResponseError(resp.Error, "read credential status")
 	}
 	return resp, 0
+}
+
+// ─── session ────────────────────────────────────────────────────────────────
+
+// runSession dispatches browser-session management (spec §23).
+//
+// The CLI never holds a session: a browser tool's cookies live under the Relay
+// home and are owned by the daemon, so these verbs only ask the daemon to run a
+// tool's declared login or to forget the session. Nothing here reports a cookie
+// back, so a session cannot leak through this command (spec §22, §40).
+func runSession(args []string) int {
+	if len(args) == 0 {
+		fmt.Fprint(os.Stderr, "usage: relay session <login|clear> <tool>\n")
+		return 2
+	}
+	switch args[0] {
+	case "login":
+		return runSessionLogin(args[1:])
+	case "clear":
+		return runSessionClear(args[1:])
+	default:
+		fmt.Fprintf(os.Stderr, "relay session: unknown subcommand %q\n", args[0])
+		return 2
+	}
+}
+
+// runSessionLogin runs a tool's declared browser login through the daemon.
+func runSessionLogin(args []string) int {
+	flags := flag.NewFlagSet("relay session login", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	flags.Usage = func() { fmt.Fprint(os.Stderr, "usage: relay session login <tool>\n") }
+	if err := flags.Parse(permute(flags, args)); err != nil {
+		return 2
+	}
+	if flags.NArg() != 1 {
+		flags.Usage()
+		return 2
+	}
+	tool := flags.Arg(0)
+
+	request := ipc.SessionLoginRequest{Type: ipc.FrameSessionLogin, Tool: tool}
+	var response ipc.SessionLoginResponse
+	if err := ipc.Call(context.Background(), paths.Default().Socket(), &request, &response); err != nil {
+		return reportIPCError(err)
+	}
+	if !response.Success {
+		return reportResponseError(response.Error, "log in browser session")
+	}
+	fmt.Printf("logged in %s\n", tool)
+	return 0
+}
+
+// runSessionClear forgets a tool's browser session through the daemon. Clearing
+// is idempotent: a tool with no session still reports success.
+func runSessionClear(args []string) int {
+	flags := flag.NewFlagSet("relay session clear", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	flags.Usage = func() { fmt.Fprint(os.Stderr, "usage: relay session clear <tool>\n") }
+	if err := flags.Parse(permute(flags, args)); err != nil {
+		return 2
+	}
+	if flags.NArg() != 1 {
+		flags.Usage()
+		return 2
+	}
+	tool := flags.Arg(0)
+
+	request := ipc.SessionClearRequest{Type: ipc.FrameSessionClear, Tool: tool}
+	var response ipc.SessionClearResponse
+	if err := ipc.Call(context.Background(), paths.Default().Socket(), &request, &response); err != nil {
+		return reportIPCError(err)
+	}
+	if !response.Success {
+		return reportResponseError(response.Error, "clear browser session")
+	}
+	fmt.Printf("cleared session for %s\n", tool)
+	return 0
 }
 
 // reportIPCError maps a transport failure to an exit code and a message.

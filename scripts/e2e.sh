@@ -112,9 +112,13 @@ export RELAY_HOME
 # server_pid is set by the offline REST round-trip below.  The trap kills it, so
 # the loopback server never outlives the run even on an early exit.
 server_pid=""
+session_pid=""
 cleanup() {
     if [ -n "${server_pid:-}" ]; then
         kill "$server_pid" >/dev/null 2>&1 || true
+    fi
+    if [ -n "${session_pid:-}" ]; then
+        kill "$session_pid" >/dev/null 2>&1 || true
     fi
     "$workdir/relay" daemon stop >/dev/null 2>&1 || true
     rm -rf "$RELAY_HOME"
@@ -682,5 +686,227 @@ check "auth logout clears it again" "false" \
     "$("$workdir/relay" auth status github --json 2>/dev/null | python3 -c 'import json,sys; print(str(json.load(sys.stdin).get("stored", False)).lower())')"
 
 echo
+
+# --- 16. pagination opt-in (spec §20) ---
+#
+# A paginated operation's strategy is projected into the executor's spec, but
+# the walk is opt-in. Without --paginate the executor makes exactly one request
+# and the CLI prints no walk diagnostic; with it the executor follows the
+# declared Link chain, aggregates the pages, and reports the walk's shape on
+# stderr while stdout stays the machine result alone.
+echo "    pagination opt-in (spec §20)"
+
+# A second loopback server carries the paginated and sessionful paths so the
+# original REST round-trip above stays byte-for-byte what it was.
+sportlog="$workdir/pages.requests"
+: > "$sportlog"
+cat > "$workdir/pages_server.py" <<'PY'
+import json, os, urllib.parse
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+PAGES = {"": ["a", "b"], "2": ["c", "d"], "3": ["e"]}
+
+
+class Handler(BaseHTTPRequestHandler):
+    # Silence the default per-request stderr logging; the request log written
+    # below is the only record this test wants.
+    def log_message(self, *args):
+        pass
+
+    def _log(self, method):
+        with open(os.environ["RELAY_E2E_PAGELOG"], "a") as f:
+            f.write("%s %s\n" % (method, self.path))
+
+    def _json(self, body, link=None, cookie=None):
+        payload = json.dumps(body).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        if link:
+            self.send_header("Link", link)
+        if cookie:
+            self.send_header("Set-Cookie", cookie)
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_GET(self):
+        self._log("GET")
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/pages":
+            page = urllib.parse.parse_qs(parsed.query).get("page", [""])[0]
+            nxt = {"": "2", "2": "3"}.get(page)
+            link = '</pages?page=%s>; rel="next"' % nxt if nxt else None
+            self._json({"items": PAGES.get(page, [])}, link=link)
+            return
+        if parsed.path == "/secure":
+            cookie = self.headers.get("Cookie", "")
+            self._json({"secure": True, "has_cookie": "sid=" in cookie})
+            return
+        self.send_response(404)
+        self.end_headers()
+
+    def do_POST(self):
+        self._log("POST")
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        if length:
+            self.rfile.read(length)
+        if urllib.parse.urlparse(self.path).path == "/login":
+            self._json({"ok": True}, cookie="sid=session-abc; Path=/")
+            return
+        self.send_response(404)
+        self.end_headers()
+
+
+server = HTTPServer(("127.0.0.1", 0), Handler)
+with open(os.environ["RELAY_E2E_PAGEPORT"], "w") as f:
+    f.write(str(server.server_address[1]))
+server.serve_forever()
+PY
+RELAY_E2E_PAGELOG="$sportlog" RELAY_E2E_PAGEPORT="$workdir/pages.port" \
+    python3 "$workdir/pages_server.py" &
+session_pid=$!
+# Detach from the job table so the trap's kill does not print a job-control
+# notice; the PID is tracked explicitly above.
+disown "$session_pid" 2>/dev/null || true
+for _ in $(seq 1 50); do
+    [ -s "$workdir/pages.port" ] && break
+    sleep 0.1
+done
+sport="$(cat "$workdir/pages.port" 2>/dev/null)"
+check "pagination loopback server is listening" "yes" "$([ -n "$sport" ] && echo yes || echo no)"
+
+cat > "$workdir/pagedemo.yaml" <<MANIFEST
+apiVersion: relay/v1
+kind: Tool
+metadata:
+  name: pagedemo
+  version: 0.0.1
+  description: offline pagination test tool
+runtime:
+  name: relay
+  apiVersion: v1
+protocol:
+  type: rest
+  baseUrl: http://127.0.0.1:$sport
+tools:
+  - name: list_pages
+    description: List a collection the server pages with Link headers
+    input:
+      type: object
+      properties: {}
+    request:
+      method: GET
+      path: /pages
+      pagination:
+        style: link-header
+MANIFEST
+"$workdir/relay" build "$workdir/pagedemo.yaml" --out "$workdir/pagedemo" >/dev/null 2>&1
+check "pagedemo tool installs" "0" "$("$workdir/relay" install "$workdir/pagedemo" >/dev/null 2>&1; echo $?)"
+
+# Default off: the declared strategy is still projected, but the request path is
+# unchanged -- one request, first page only, no walk diagnostic anywhere.
+before=$(wc -l < "$sportlog" | tr -d ' ')
+default_out="$workdir/pages-default.out"
+default_err="$workdir/pages-default.err"
+"$workdir/relay" run pagedemo list_pages > "$default_out" 2> "$default_err"
+check "list_pages without --paginate exits 0" "0" "$?"
+check "list_pages default makes exactly one request" "1" "$(( $(wc -l < "$sportlog" | tr -d ' ') - before ))"
+check "list_pages default hits the first page only" "GET /pages" "$(tail -n 1 "$sportlog")"
+check "list_pages default returns the first page alone" "ok" \
+    "$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("ok" if d == {"items": ["a", "b"]} else "bad:" + repr(d))' "$default_out" 2>&1)"
+check "list_pages default keeps stderr silent" "0" "$(wc -c < "$default_err" | tr -d ' ')"
+check "list_pages default stdout stays machine-only" "ok" "$(grep -q collected "$default_out" && echo bad || echo ok)"
+
+# Opt in: the executor follows the Link chain, aggregates the pages, and the
+# walk's shape is reported on stderr while stdout remains the JSON result.
+before=$(wc -l < "$sportlog" | tr -d ' ')
+paged_out="$workdir/pages.out"
+paged_err="$workdir/pages.err"
+"$workdir/relay" run pagedemo list_pages --paginate > "$paged_out" 2> "$paged_err"
+check "list_pages --paginate exits 0" "0" "$?"
+check "list_pages --paginate walks all three pages" "3" "$(( $(wc -l < "$sportlog" | tr -d ' ') - before ))"
+check "list_pages --paginate walks the Link chain in order" "GET /pages|GET /pages?page=2|GET /pages?page=3|" "$(tail -n 3 "$sportlog" | tr '\n' '|')"
+check "list_pages --paginate aggregates every page" "ok" \
+    "$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("ok" if d == {"items": ["a", "b", "c", "d", "e"]} else "bad:" + repr(d))' "$paged_out" 2>&1)"
+check "list_pages --paginate reports the walk on stderr" "ok" "$(grep -q 'collected 3 pages' "$paged_err" && echo ok || echo bad)"
+check "list_pages --paginate stdout is still pure JSON" "ok" "$(python3 -c 'import json,sys; json.load(open(sys.argv[1])); print("ok")' "$paged_out" 2>&1)"
+check "list_pages --paginate never mixes a diagnostic into stdout" "ok" "$(grep -q 'collected\|relay:' "$paged_out" && echo bad || echo ok)"
+
+# --- 17. browser session verbs and an end-to-end session (spec §23) ---
+#
+# session_login runs a tool's declared login and stores the cookie; a later
+# operation sends it. A tool with no login declared fails loudly, clearing is
+# idempotent, and no verb ever prints the cookie.
+echo "    browser session (spec §23)"
+check "relay session with no subcommand is a usage error" "2" "$("$workdir/relay" session >/dev/null 2>&1; echo $?)"
+check "relay session with an unknown subcommand is a usage error" "2" "$("$workdir/relay" session frobnicate demo >/dev/null 2>&1; echo $?)"
+check "relay session login with no tool is a usage error" "2" "$("$workdir/relay" session login >/dev/null 2>&1; echo $?)"
+
+no_login_err="$workdir/session-nologin.err"
+"$workdir/relay" session login demo >/dev/null 2> "$no_login_err"
+check "session login on a tool with no login block fails" "1" "$?"
+check "session login on a tool with no login block is INVALID_INPUT" "ok" "$(grep -q INVALID_INPUT "$no_login_err" && echo ok || echo bad)"
+
+check "session clear of a session-less tool is idempotent" "0" "$("$workdir/relay" session clear demo >/dev/null 2>&1; echo $?)"
+
+cat > "$workdir/browserdemo.yaml" <<MANIFEST
+apiVersion: relay/v1
+kind: Tool
+metadata:
+  name: browserdemo
+  version: 0.0.1
+  description: offline browser-session test tool
+runtime:
+  name: relay
+  apiVersion: v1
+protocol:
+  type: browser
+  baseUrl: http://127.0.0.1:$sport
+auth:
+  type: basic
+  login:
+    kind: form
+    path: /login
+    usernameField: user
+    passwordField: pass
+tools:
+  - name: secure
+    description: Read a resource that needs the stored session
+    input:
+      type: object
+      properties: {}
+    request:
+      method: GET
+      path: /secure
+MANIFEST
+"$workdir/relay" build "$workdir/browserdemo.yaml" --out "$workdir/browserdemo" >/dev/null 2>&1
+check "browser tool installs" "0" "$("$workdir/relay" install "$workdir/browserdemo" >/dev/null 2>&1; echo $?)"
+printf 'alice:secret\n' | "$workdir/relay" auth login browserdemo >/dev/null 2>&1
+
+browser_tool="$RELAY_HOME/tools/browserdemo"
+before_secure="$workdir/secure-before.err"
+"$browser_tool" secure >/dev/null 2> "$before_secure"
+check "browser operation before login is AUTH_REQUIRED" "ok" "$(grep -q AUTH_REQUIRED "$before_secure" && echo ok || echo bad)"
+check "browser operation before login points at session login" "ok" "$(grep -q 'relay session login browserdemo' "$before_secure" && echo ok || echo bad)"
+
+browser_login_out="$workdir/session-browser.out"
+browser_login_err="$workdir/session-browser.err"
+"$workdir/relay" session login browserdemo > "$browser_login_out" 2> "$browser_login_err"
+check "relay session login exits 0" "0" "$?"
+check "relay session login reports the tool" "ok" "$(grep -q 'logged in browserdemo' "$browser_login_out" && echo ok || echo bad)"
+check "relay session login never prints the cookie" "0" "$(cat "$browser_login_out" "$browser_login_err" | grep -c 'session-abc')"
+
+secure_out="$workdir/secure-after.out"
+secure_err="$workdir/secure-after.err"
+"$browser_tool" secure > "$secure_out" 2> "$secure_err"
+check "browser operation after login exits 0" "0" "$?"
+check "browser operation sends the stored session" "ok" "$(python3 -c 'import json,sys; print("ok" if json.load(open(sys.argv[1])).get("has_cookie") else "bad")' "$secure_out" 2>&1)"
+
+check "relay session clear browserdemo exits 0" "0" "$("$workdir/relay" session clear browserdemo >/dev/null 2>&1; echo $?)"
+revoked_err="$workdir/secure-revoked.err"
+"$browser_tool" secure >/dev/null 2> "$revoked_err"
+check "browser operation after clear is AUTH_REQUIRED" "ok" "$(grep -q AUTH_REQUIRED "$revoked_err" && echo ok || echo bad)"
+"$workdir/relay" auth logout browserdemo >/dev/null 2>&1
+
 echo "passed: $passed   failed: $failed"
 [ "$failed" -eq 0 ]

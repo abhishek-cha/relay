@@ -121,6 +121,10 @@ func run(args []string) int {
 		Socket:    *socket,
 		Log:       logDestination,
 		Telemetry: usage,
+		// The session store is shared with the browser executor above, so a
+		// session_login frame and a later browser operation use one cookie jar
+		// (spec §23).
+		Sessions: browserSessions,
 		Executors: map[string]protocol.Executor{
 			"rest":    rest.New(),
 			"graphql": graphql.New(),

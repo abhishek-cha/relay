@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"relay/internal/auth"
+	"relay/internal/browser"
 	"relay/internal/ipc"
 	"relay/internal/keychain"
 	"relay/internal/manifest"
@@ -59,6 +60,11 @@ type Config struct {
 	Socket string
 	// Log receives daemon diagnostics. Defaults to stderr.
 	Log io.Writer
+	// Sessions owns the browser tools' login flows and cookie jars (spec §23).
+	// The daemon must be handed the same instance its browser executor uses, so a
+	// `session_login` frame and a later browser operation share one store; a nil
+	// value leaves browser sessions unconfigured rather than silently separate.
+	Sessions *browser.Sessions
 }
 
 // Daemon serves Relay operations over IPC.
@@ -76,6 +82,7 @@ type Daemon struct {
 	started        time.Time
 	socket         string
 	logw           io.Writer
+	sessions       *browser.Sessions
 }
 
 // New builds a daemon. The daemon owns its Relay home: it is the only writer of
@@ -130,6 +137,7 @@ func New(cfg Config) *Daemon {
 		started:        now(),
 		socket:         socket,
 		logw:           logw,
+		sessions:       cfg.Sessions,
 	}
 }
 
@@ -237,6 +245,20 @@ func (d *Daemon) Handle(ctx context.Context, kind string, frame []byte) (any, er
 			return failedDeviceWait(failure), nil
 		}
 		return d.authDeviceWait(ctx, request), nil
+
+	case ipc.FrameSessionLogin:
+		var request ipc.SessionLoginRequest
+		if failure := decode(frame, &request); failure != nil {
+			return failedSessionLogin(failure), nil
+		}
+		return d.sessionLogin(ctx, request), nil
+
+	case ipc.FrameSessionClear:
+		var request ipc.SessionClearRequest
+		if failure := decode(frame, &request); failure != nil {
+			return failedSessionClear(failure), nil
+		}
+		return d.sessionClear(request), nil
 
 	default:
 		return map[string]any{
@@ -352,6 +374,7 @@ func (d *Daemon) invokeOperation(ctx context.Context, request relay.InvokeReques
 		Operation:  operation.Name,
 		Input:      request.Input,
 		Credential: credential,
+		Paginate:   request.Paginate,
 		Spec:       specFor(doc, operation),
 	})
 	if err != nil {
@@ -361,7 +384,12 @@ func (d *Daemon) invokeOperation(ctx context.Context, request relay.InvokeReques
 			// the stored secret was refused, not that the user never logged in.
 			// Only the daemon knows whether a credential was injected, so the
 			// executor cannot make this distinction itself (spec §26).
-			if credential != nil && structured.Code == relay.CodeAuthRequired {
+			//
+			// A browser tool is the exception: its executor never attaches the
+			// credential to an operation and reports AUTH_REQUIRED only for a
+			// missing session, so refining it would point the user at
+			// 'relay auth login' instead of 'relay session login' (spec §23).
+			if credential != nil && doc.Protocol.Type != "browser" && structured.Code == relay.CodeAuthRequired {
 				structured = relay.NewError(relay.CodeAuthFailed,
 					fmt.Sprintf("the service rejected the stored credential for %q; run 'relay auth login %s' to replace it",
 						installation.Name, installation.Name)).
@@ -372,7 +400,15 @@ func (d *Daemon) invokeOperation(ctx context.Context, request relay.InvokeReques
 		return invokeFailure(relay.NewError(relay.CodeProtocolError, err.Error()))
 	}
 
-	return relay.InvokeResponse{Success: true, Result: response.Body}
+	invoked := relay.InvokeResponse{Success: true, Result: response.Body}
+	// Surface the walk's shape only when the caller opted into pagination, so an
+	// ordinary invocation's reply stays byte-identical and a bounded walk is
+	// never passed off as complete (spec §20).
+	if request.Paginate {
+		invoked.Pages = response.Pages
+		invoked.Truncated = response.Truncated
+	}
+	return invoked
 }
 
 // credential resolves the secret to inject at execution time (spec §21, §22).
@@ -471,6 +507,27 @@ func specFor(doc *manifest.Document, operation *manifest.Tool) protocol.Spec {
 
 		Document:  operation.Request.Document,
 		Variables: operation.Request.Variables,
+
+		Pagination: paginationFor(operation.Request.Pagination),
+	}
+}
+
+// paginationFor projects a manifest's declared pagination strategy into the
+// transport-neutral shape an Executor reads (spec §19, §20). A nil manifest
+// block projects to a nil spec block, so an operation that declares no strategy
+// keeps executing as a single request.
+func paginationFor(source *manifest.Pagination) *protocol.Pagination {
+	if source == nil {
+		return nil
+	}
+	return &protocol.Pagination{
+		Style:        source.Style,
+		CursorParam:  source.CursorParam,
+		CursorIn:     source.CursorIn,
+		CursorField:  source.CursorField,
+		HasMoreField: source.HasMoreField,
+		LimitParam:   source.LimitParam,
+		Limit:        source.Limit,
 	}
 }
 

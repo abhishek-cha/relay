@@ -852,6 +852,9 @@ Support:
   the caller; a walk is bounded by a maximum page count and a maximum total
   response size, and a partial result is reported as truncated rather than
   passed off as a single page.
+  The CLI turns a walk on with `relay run <tool> <operation> --paginate`; the
+  default stays a single request, and a reply reports the page count and
+  whether the walk was truncated.
 * Authentication
 * Error handling
 
@@ -976,6 +979,9 @@ auth:
     usernameField: user
     passwordField: pass
 
+The CLI surface is explicit: `relay session login <tool>` runs the declared
+login and stores the session, and `relay session clear <tool>` forgets it.
+Neither sends, returns, or prints a cookie, and both travel as IPC frames.
 Operations carry the same request shape REST uses (method, path, query, headers,
 body), so only the transport differs and neither the CLI nor MCP changes
 (spec 19). The daemon owns the session: cookies are written under the Relay home

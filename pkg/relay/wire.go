@@ -42,6 +42,13 @@ type InvokeRequest struct {
 	Tool      string         `json:"tool"`
 	Operation string         `json:"operation"`
 	Input     map[string]any `json:"input"`
+
+	// Paginate asks the daemon to follow a REST operation's declared pagination
+	// strategy and return the whole collection (spec §20). It is additive and
+	// opt-in: an omitted field stays false, so the request a caller sends by
+	// default is byte-for-byte the one that predates pagination, and an
+	// operation with no declared strategy always runs as a single request.
+	Paginate bool `json:"paginate,omitempty"`
 }
 
 // InvokeResponse is the daemon's reply. Exactly one of Result or Error is set.
@@ -49,4 +56,12 @@ type InvokeResponse struct {
 	Success bool   `json:"success"`
 	Result  any    `json:"result,omitempty"`
 	Error   *Error `json:"error,omitempty"`
+
+	// Pages and Truncated report how a paginated request was satisfied (spec
+	// §20). They are set only when the caller opted in; an ordinary invocation
+	// leaves both at their zero values and therefore unchanged on the wire.
+	// Truncated is true when the walk stopped at an executor cap while more pages
+	// remained, so a bounded walk is never mistaken for the whole collection.
+	Pages     int  `json:"pages,omitempty"`
+	Truncated bool `json:"truncated,omitempty"`
 }
