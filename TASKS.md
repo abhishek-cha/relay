@@ -290,9 +290,17 @@ request input value finds nothing.
 - [x] Capability declarations: `network`, `keychain`, `browser`, `filesystem.read`, `filesystem.write`, `shell`, `notifications`, `clipboard` — `internal/permissions`
 - [x] Permission policy: host allowlists, filesystem scopes; a tool asking for a new capability is not silently granted it — `internal/permissions/policy.go`, enforced in `internal/daemon/permissions.go`
 - [x] Confirmation policy for destructive operations (`delete_repository`, `send_message`, `charge_customer`) with CLI and MCP parity — `CodeConfirmationRequired` → `PERMISSION_DENIED` on both paths
+- [ ] `relayd --destructive-op` (or a config file) so the daemon's destructive list is set without a code change — `Config.DestructiveOps` exists but nothing populates it
+- [ ] Interactive confirmation prompt for destructive operations — today a matched operation is refused outright
 - [ ] Signed tools: verify publisher, signature, binary, and manifest at install (§48)
 - [ ] Trust levels: trusted / verified / unknown / blocked (§49)
 - [ ] Hosted registry, `relay search`, `relay install <name>` (§47)
+
+**Decisions taken:**
+
+- **The capability model is opt-in per tool.** `participatesInCapabilityModel` (`internal/daemon/permissions.go`) is true only when a manifest declares `capabilities` or `permissions`. A pre-model manifest states no requirements and runs unchecked, so the check could not silently break tools built before it existed; a manifest that declares either is then held default-deny — an unnamed capability is refused and an unscoped host is refused (§24). The destructive gate sits outside this opt-out on purpose: it is driven by daemon configuration, so a destructive operation is gated whether or not the tool declares a capability surface.
+- **The destructive list is daemon-owned, not manifest-owned.** `PolicyFromManifest` takes it from the caller (`Config.DestructiveOps`), so a tool cannot widen its own confirmation surface by editing its manifest.
+- **A destructive operation is refused, not prompted.** There is no interactive confirmation yet, so a matched operation returns `PERMISSION_DENIED` naming confirmation rather than running.
 
 ---
 
