@@ -295,8 +295,8 @@ request input value finds nothing.
 
 ### M10 follow-up
 
-- [ ] A gRPC operation is addressed through `request.path` only (`/package.Service/Method`); add literal `request.package` / `request.service` / `request.method` manifest fields and project them in `specFor` — `internal/manifest`, `internal/protocol/grpc`
-- [ ] Expose the pagination opt-in through MCP. Today only the CLI can ask for a walk: the `Invoker` seam and the advertised tool `inputSchema` would both need a `paginate` argument, so MCP stays on the single-page default — `internal/mcp`
+- [x] A gRPC operation may name its method literally — `request.package` / `request.service` / `request.method` assemble `/package.Service/Method`; the fields are grpc-only, must be declared together, and `request.path` addressing still works, with both forms at once rejected as ambiguous — `internal/manifest`, `internal/protocol/grpc`
+- [x] The pagination opt-in crosses the MCP seam — an operation that declares a strategy advertises an optional `paginate` argument, the walk's `pages`/`truncated` shape rides in the MCP result, and a caller asking an incapable invoker to paginate is refused rather than handed page one — `internal/mcp`
 - [ ] Browser OAuth2 redirect/authorization-code login, which needs a loopback redirect and a browser handoff; the device grant in `internal/auth` covers the OAuth2 tools that can use it — `internal/browser`
 
 ## M11 — Security, permissions, distribution  (§24, §25, §40, §41, §47, §48, §49)
