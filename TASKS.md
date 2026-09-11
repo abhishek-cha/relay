@@ -150,7 +150,7 @@ raw so `url.Values.Encode` owns query encoding.
 - [x] Credential types: API key, bearer token, basic auth, client credentials, OAuth2 — `internal/auth`
 - [x] macOS Keychain via the `security` CLI (or Security.framework); namespace `com.relay.<tool>`, account `default` — `internal/keychain`
 - [x] `relay auth login <tool>` / `logout` / `status` — the CLI hands the secret to the daemon once and never stores or echoes it
-- [ ] OAuth2 device-code or PKCE flow — `relay auth login` stores an already-issued token; the flow choice is still open decision #5
+- [x] OAuth2 device-code flow (RFC 8628) — the daemon owns the whole grant, holds the device code, polls, and writes the token straight to the Keychain; `relay auth login` prints the code and waits. A manifest that declares no device endpoints keeps the pasted-token path. PKCE remains open for a future browser flow (open decision #5, narrowed) — `internal/auth/device.go`, `internal/ipc/device.go`
 - [x] Daemon injects credentials at execution time (§22); the tool binary never handles secrets — resolved through `auth.Resolver`
 - [x] Redaction guarantees: secrets absent from CLI output, MCP output, logs, telemetry, manifests, skills — `internal/keychain/redact.go`
 - [x] `AUTH_REQUIRED` / `AUTH_FAILED` surfaced identically to CLI and MCP
@@ -280,7 +280,8 @@ request input value finds nothing.
 
 - [x] `GraphQLExecutor` (`protocol.type: graphql`) — query and variables from the manifest; CLI and MCP unchanged — `internal/protocol/graphql`
 - [ ] `GRPCExecutor` (`protocol.type: grpc`) — service and method from the manifest; reflection or bundled descriptors
-- [ ] `LocalExecutor` — filesystem, git, docker, kubectl, ssh, clipboard, notifications, calendar (§46)
+- [x] `LocalExecutor`, filesystem and git families — `protocol.type: local`; `read_file`, `write_file`, `list_directory`, `stat`, `git_status`, `git_diff`, `git_log`. Paths resolve symlink-free and must fall inside the declared `permissions.filesystem` scopes; an undeclared capability fails closed — `internal/protocol/local`
+- [ ] `LocalExecutor`, remaining families — docker, kubectl, ssh, clipboard, notifications, calendar (§46)
 - [ ] `BrowserExecutor` (§23) — shared login, cookies, sessions, OAuth, web interaction
 
 ---
@@ -292,8 +293,8 @@ request input value finds nothing.
 - [x] Confirmation policy for destructive operations (`delete_repository`, `send_message`, `charge_customer`) with CLI and MCP parity — `CodeConfirmationRequired` → `PERMISSION_DENIED` on both paths
 - [ ] `relayd --destructive-op` (or a config file) so the daemon's destructive list is set without a code change — `Config.DestructiveOps` exists but nothing populates it
 - [ ] Interactive confirmation prompt for destructive operations — today a matched operation is refused outright
-- [ ] Signed tools: verify publisher, signature, binary, and manifest at install (§48)
-- [ ] Trust levels: trusted / verified / unknown / blocked (§49)
+- [x] Signed tools: verify publisher, signature, binary, and manifest at install (§48) — ed25519 over a domain-separated canonical byte string that binds the manifest digest, the descriptor digest, and the binary digest, so swapping the executable invalidates the signature; `relay keygen` / `relay sign`, sidecar `<binary>.sig`, refused with `SIGNATURE_INVALID` before anything is copied — `internal/sign`
+- [x] Trust levels: trusted / verified / unknown / blocked (§49) — a `blocked` rule wins even over a valid signature, an allowlisted tool is `trusted` without one, a verified signature is `verified`, and an unsigned tool still installs as `unknown` rather than being refused — `$RELAY_HOME/config/trust.yaml`, `internal/registry/trust.go`
 - [ ] Hosted registry, `relay search`, `relay install <name>` (§47)
 
 **Decisions taken:**

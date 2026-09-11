@@ -2,14 +2,14 @@
 
 Example tool projects, one directory per tool, in the same shape as the
 `templates/` pair: `<tool>.yaml` is the machine truth, and `SKILL.md` is the
-LLM guidance. Every example here is buildable with the command below; only the
-`filesystem` one is not yet executable.
+LLM guidance. Every example here is buildable and executable with the commands
+below.
 
 | Example | Protocol | Skill | Status |
 | --- | --- | --- | --- |
 | `github/` | REST | yes | the canonical, spec-derived pair; runs with a credential |
 | `slack/` | REST | yes | real schemas and bearer auth; not exercised against the live API |
-| `filesystem/` | local | yes | builds, but not executable — Relay has no local executor yet |
+| `filesystem/` | local | yes | real filesystem and git primitives, scoped by declared permissions |
 | `stripe/` | REST | no | manifest-only draft; builds with a "no skill" warning |
 
 Build any of them from the repository root:

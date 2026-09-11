@@ -569,6 +569,118 @@ post_content=$(cat "$RELAY_HOME/registry/github.json")
 check "re-install exits 0" "0" "$reinstall_exit"
 check "registry unchanged" "ok" "$([ "$pre_content" = "$post_content" ] && echo ok || echo bad)"
 
+# --- 14. MCP skill resources: discovery, read, and CLI/MCP parity (spec §8, §29) ---
+#
+# §29 requires MCP to see the same skill the CLI sees. The daemon is up and
+# github is installed, so resources/read travels the real path: MCP asks the
+# daemon, the daemon asks the installed binary, and the bytes must equal
+# `github --skill`. A crafted URI must be rejected before any registry lookup,
+# and an unregistered tool must come back as a structured error, not a crash.
+echo "    MCP skill resources"
+
+skill_frames="$workdir/mcp.skill.frames.jsonl"
+cat > "$skill_frames" <<'JSONL'
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"relay-e2e","version":"0.0.0"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+{"jsonrpc":"2.0","id":2,"method":"resources/list"}
+{"jsonrpc":"2.0","id":3,"method":"resources/read","params":{"uri":"relay://skill/github"}}
+{"jsonrpc":"2.0","id":4,"method":"resources/read","params":{"uri":"relay://skill/nope"}}
+{"jsonrpc":"2.0","id":5,"method":"resources/read","params":{"uri":"relay://skill/../etc"}}
+JSONL
+
+skill_out="$workdir/mcp.skill.out.jsonl"
+skill_err_file="$workdir/mcp.skill.err"
+"$workdir/relay" mcp < "$skill_frames" > "$skill_out" 2> "$skill_err_file"
+skill_exit=$?
+check "relay mcp skill run exits 0 at stdin EOF" "0" "$skill_exit"
+check "relay mcp skill run keeps stderr empty" "0" "$(wc -c < "$skill_err_file" | tr -d ' ')"
+
+check "resources/list advertises relay://skill/github as text/markdown" "ok" "$(python3 - "$skill_out" <<'PY'
+import json, sys
+frames = {}
+for line in open(sys.argv[1]):
+    if line.strip():
+        frame = json.loads(line)
+        frames[frame.get("id")] = frame
+resources = frames.get(2, {}).get("result", {}).get("resources")
+problems = []
+if not isinstance(resources, list):
+    problems.append("resources=%r" % (resources,))
+else:
+    match = [r for r in resources if r.get("uri") == "relay://skill/github"]
+    if len(match) != 1:
+        problems.append("github entries=%d" % len(match))
+    elif match[0].get("mimeType") != "text/markdown":
+        problems.append("mimeType=%r" % match[0].get("mimeType"))
+    if any("nope" in r.get("uri", "") for r in resources):
+        problems.append("unregistered tool advertised")
+print("ok" if not problems else "bad:" + ";".join(problems))
+PY
+)"
+
+check "resources/read matches github --skill byte for byte" "ok" "$(python3 - "$skill_out" "$tool" <<'PY'
+import json, subprocess, sys
+frames = {}
+for line in open(sys.argv[1]):
+    if line.strip():
+        frame = json.loads(line)
+        frames[frame.get("id")] = frame
+contents = frames.get(3, {}).get("result", {}).get("contents") or []
+cli = subprocess.run([sys.argv[2], "--skill"], capture_output=True, text=True).stdout
+problems = []
+if len(contents) != 1:
+    problems.append("contents=%d" % len(contents))
+else:
+    entry = contents[0]
+    if entry.get("uri") != "relay://skill/github":
+        problems.append("uri=%r" % entry.get("uri"))
+    if entry.get("mimeType") != "text/markdown":
+        problems.append("mimeType=%r" % entry.get("mimeType"))
+    if entry.get("text") != cli:
+        problems.append("text differs from --skill (%d vs %d bytes)" % (len(entry.get("text") or ""), len(cli)))
+print("ok" if not problems else "bad:" + ";".join(problems))
+PY
+)"
+
+check "unknown and crafted skill URIs are structured errors" "ok" "$(python3 - "$skill_out" <<'PY'
+import json, sys
+frames = {}
+for line in open(sys.argv[1]):
+    if line.strip():
+        frame = json.loads(line)
+        frames[frame.get("id")] = frame
+problems = []
+unknown = frames.get(4, {}).get("error") or {}
+if (unknown.get("data") or {}).get("code") != "TOOL_NOT_FOUND":
+    problems.append("unknown tool code=%r" % ((unknown.get("data") or {}).get("code"),))
+crafted = frames.get(5, {}).get("error") or {}
+if (crafted.get("data") or {}).get("code") != "INVALID_INPUT":
+    problems.append("crafted uri code=%r" % ((crafted.get("data") or {}).get("code"),))
+print("ok" if not problems else "bad:" + ";".join(problems))
+PY
+)"
+
+# --- 15. auth login keeps the pasted-token path (spec 21, 54) ---
+#
+# github declares oauth2 with no device endpoints, so the device authorization
+# grant cannot run and `relay auth login` must fall back to the pasted token it
+# always used. stdin is a pipe here, so the secret is read as one line and the
+# check that nothing echoes it stays meaningful.
+echo "    auth login pasted-token fallback"
+"$workdir/relay" daemon start >/dev/null 2>&1
+sleep 1
+login_out="$workdir/auth-login.out"
+login_err="$workdir/auth-login.err"
+printf 'e2e-token-value\n' | "$workdir/relay" auth login github > "$login_out" 2> "$login_err"
+login_exit=$?
+check "auth login exits 0 on the pasted-token fallback" "0" "$login_exit"
+check "auth login never echoes the secret" "0" "$(cat "$login_out" "$login_err" | grep -c 'e2e-token-value')"
+check "auth status reports the credential stored" "true" \
+    "$("$workdir/relay" auth status github --json 2>/dev/null | python3 -c 'import json,sys; print(str(json.load(sys.stdin).get("stored", False)).lower())')"
+"$workdir/relay" auth logout github >/dev/null 2>&1
+check "auth logout clears it again" "false" \
+    "$("$workdir/relay" auth status github --json 2>/dev/null | python3 -c 'import json,sys; print(str(json.load(sys.stdin).get("stored", False)).lower())')"
+
 echo
 echo "passed: $passed   failed: $failed"
 [ "$failed" -eq 0 ]
