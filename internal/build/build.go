@@ -64,6 +64,12 @@ func Build(ctx context.Context, opts Options) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The skill is guidance, never a second schema, so a skill that restates the
+	// manifest's inputs is a build error rather than a warning: shipping it would
+	// give an agent two places to read a schema from and let them drift (§7, §30).
+	if err := lintSkill(skillBytes, doc, opts.Verbose); err != nil {
+		return nil, err
+	}
 
 	sourceRoot, err := findSourceRoot(opts.SourceRoot)
 	if err != nil {
@@ -152,6 +158,35 @@ func Build(ctx context.Context, opts Options) (*Result, error) {
 		_ = os.RemoveAll(filepath.Dir(workDir))
 	}
 	return result, nil
+}
+
+// lintSkill enforces the manifest/skill split (spec §7, §30).
+//
+// An Error-severity issue fails the build; a Warning is printed but tolerated,
+// because a weak skill is a quality problem while a schema-restating one is a
+// correctness problem: two sources of truth that will drift apart.
+func lintSkill(skillBytes []byte, doc *manifest.Document, verbose bool) error {
+	// No skill was supplied: loadSkill already warned, and there is nothing to
+	// lint. An explicitly empty file never reaches here, because skill.Validate
+	// rejects it first.
+	if len(skillBytes) == 0 {
+		return nil
+	}
+	issues := skill.Lint(string(skillBytes), doc)
+	var failures []string
+	for _, issue := range issues {
+		if issue.Severity == skill.Error {
+			failures = append(failures, fmt.Sprintf("%d: %s", issue.Line, issue.Message))
+			continue
+		}
+		if verbose {
+			fmt.Fprintf(os.Stderr, "relay: skill warning (line %d): %s\n", issue.Line, issue.Message)
+		}
+	}
+	if len(failures) > 0 {
+		return fmt.Errorf("skill does not meet §30: %s", strings.Join(failures, "; "))
+	}
+	return nil
 }
 
 func loadSkill(path string, verbose bool) ([]byte, error) {
