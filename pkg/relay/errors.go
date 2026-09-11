@@ -24,6 +24,12 @@ const (
 	CodeRemoteError         Code = "REMOTE_ERROR"
 	CodeProtocolError       Code = "PROTOCOL_ERROR"
 	CodeRuntimeIncompatible Code = "RUNTIME_INCOMPATIBLE"
+
+	// Codes from the signing and distribution surface (spec §48, §49). They are
+	// part of the same table because an install failure is reported to the same
+	// callers, through the same structured shape.
+	CodeSignatureInvalid Code = "SIGNATURE_INVALID"
+	CodeToolBlocked      Code = "TOOL_BLOCKED"
 )
 
 // Error is the single error shape returned over IPC, printed by the CLI, and

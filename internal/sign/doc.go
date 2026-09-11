@@ -72,7 +72,7 @@
 // # Error codes
 //
 // The install path refuses a bad signature with [CodeSignatureInvalid] and a
-// blocked tool with [CodeToolBlocked]. Both are [relay.Code] values, so they
-// travel on the wire exactly like the codes in pkg/relay; they live here until
-// the §26 code table can absorb them.
+// blocked tool with [CodeToolBlocked]. Both are aliases of codes in the §26
+// table in pkg/relay, so they travel on the wire exactly like every other
+// structured error.
 package sign

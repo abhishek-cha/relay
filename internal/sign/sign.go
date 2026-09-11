@@ -30,12 +30,13 @@ const Algorithm = "ed25519"
 // writes <tool>.sig next to the binary, and `relay install` looks for it there.
 const SignatureSuffix = ".sig"
 
-// Error codes produced by the install path (spec §48, §49). They are relay.Code
-// values so they render identically to the §26 table; see the package doc for
-// why they are declared here rather than in pkg/relay.
+// Error codes produced by the install path (spec §48, §49). They are aliases of
+// the §26 table in pkg/relay so an install failure renders identically to every
+// other structured error; these names exist so callers in this package read
+// naturally.
 const (
-	CodeSignatureInvalid relay.Code = "SIGNATURE_INVALID"
-	CodeToolBlocked      relay.Code = "TOOL_BLOCKED"
+	CodeSignatureInvalid = relay.CodeSignatureInvalid
+	CodeToolBlocked      = relay.CodeToolBlocked
 )
 
 // Signature is a publisher's signed claim about one tool build. It is
