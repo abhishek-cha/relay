@@ -280,8 +280,6 @@ request input value finds nothing.
 
 - [x] `GraphQLExecutor` (`protocol.type: graphql`) — query and variables from the manifest; CLI and MCP unchanged — `internal/protocol/graphql`
 - [ ] `GRPCExecutor` (`protocol.type: grpc`) — service and method from the manifest; reflection or bundled descriptors
-- [x] `LocalExecutor`, filesystem and git families — `protocol.type: local`; `read_file`, `write_file`, `list_directory`, `stat`, `git_status`, `git_diff`, `git_log`. Paths resolve symlink-free and must fall inside the declared `permissions.filesystem` scopes; an undeclared capability fails closed — `internal/protocol/local`
-- [ ] `LocalExecutor`, remaining families — docker, kubectl, ssh, clipboard, notifications, calendar (§46)
 - [ ] `BrowserExecutor` (§23) — shared login, cookies, sessions, OAuth, web interaction
 
 ---
