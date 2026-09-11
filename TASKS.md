@@ -125,12 +125,13 @@ Break any of these and the product stops being Relay.
 - [x] Response body is parsed as JSON when the content type says so, with a raw fallback
 - [x] Structured errors (§26): map status/transport failures → `AUTH_REQUIRED`, `AUTH_FAILED`, `PERMISSION_DENIED`, `RATE_LIMITED`, `REMOTE_ERROR`, `NETWORK_ERROR`, `TIMEOUT`
 - [x] Context timeouts and cancellation; retry/backoff for 429/5xx honoring `Retry-After`, bounded attempts
-- [~] Pagination (§20): a declared strategy (Link header and cursor param at minimum)
-      The manifest `request.pagination` block and both strategies (`link-header`,
-      `cursor`) are implemented in `internal/protocol/rest` behind overridable page
-      and total-byte caps, and the no-pagination path is unchanged. Remaining: `specFor`
-      does not project the block into `protocol.Spec` and nothing sets `Request.Paginate`,
-      so a walk is not yet reachable end-to-end.
+- [x] Pagination (§20): a declared strategy (Link header and cursor param at minimum) —
+      the manifest `request.pagination` block, both strategies (`link-header`, `cursor`),
+      and overridable page / total-byte caps live in `internal/protocol/rest`; `specFor`
+      projects the block and the caller opts in with `relay run --paginate` (opt-in is
+      additive, so the default request remains one page). The walk's shape is reported on
+      stderr when requested, and `Pages`/`Truncated` say when a walk was bounded. MCP is
+      left on the single-page default; see M10 follow-up.
 - [x] Protocol dispatch from `protocol.type`; unknown or unimplemented type → `PROTOCOL_ERROR`
 
 **Notes.** Retries are limited to idempotent methods (GET/HEAD/PUT/DELETE); a POST is
@@ -282,20 +283,21 @@ request input value finds nothing.
 
 - [x] `GraphQLExecutor` (`protocol.type: graphql`) — query and variables from the manifest; CLI and MCP unchanged — `internal/protocol/graphql`
 - [x] `GRPCExecutor` (`protocol.type: grpc`) — address from `protocol.endpoint`, method from `request.path` (`/package.Service/Method`), JSON message body; descriptors resolved through server reflection v1, so no generated stubs. Failures map onto §26: `NETWORK_ERROR`, `TIMEOUT`, `REMOTE_ERROR` with the status code, `PROTOCOL_ERROR` for an unresolvable method — `internal/protocol/grpc`
-- [~] `BrowserExecutor` (§23) — shared login, cookies, sessions, OAuth, web interaction
-      A session-carrying HTTP executor on `net/http` + `cookiejar` is in place
-      (`internal/browser`, `internal/protocol/browser`): form and header login from the
-      Keychain, persisted per-tool sessions at `$RELAY_HOME/sessions/`, `AUTH_REQUIRED`
-      with no session, and no cross-host cookie leak on redirect. JavaScript/DOM
-      interaction is out of scope by design; the OAuth2 redirect flow is not yet built.
-      Remaining: the daemon does not handle the `session_login`/`session_clear` frames,
-      so no login can reach the store.
+- [x] `BrowserExecutor` (§23) — a session-carrying HTTP executor on `net/http` +
+      `cookiejar` (`internal/browser`, `internal/protocol/browser`): form and header login
+      from the Keychain, per-tool sessions persisted at `$RELAY_HOME/sessions/` (0600),
+      `AUTH_REQUIRED` with no session, and no cross-host cookie leak on redirect. The
+      daemon handles the `session_login` / `session_clear` frames against the same store
+      the executor uses, reached with `relay session login|clear <tool>`. JavaScript/DOM
+      interaction is out of scope by design.
 
 ---
 
 ### M10 follow-up
 
 - [ ] A gRPC operation is addressed through `request.path` only (`/package.Service/Method`); add literal `request.package` / `request.service` / `request.method` manifest fields and project them in `specFor` — `internal/manifest`, `internal/protocol/grpc`
+- [ ] Expose the pagination opt-in through MCP. Today only the CLI can ask for a walk: the `Invoker` seam and the advertised tool `inputSchema` would both need a `paginate` argument, so MCP stays on the single-page default — `internal/mcp`
+- [ ] Browser OAuth2 redirect/authorization-code login, which needs a loopback redirect and a browser handoff; the device grant in `internal/auth` covers the OAuth2 tools that can use it — `internal/browser`
 
 ## M11 — Security, permissions, distribution  (§24, §25, §40, §41, §47, §48, §49)
 
