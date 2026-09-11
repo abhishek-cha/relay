@@ -1,26 +1,21 @@
 # Local filesystem capabilities — the "Relay is not an API wrapper" example
-# (spec 46). This tool describes a local capability rather than a remote API,
-# which is the point: the tool/daemon/skill model does not assume HTTP.
+# (spec 46). This manifest describes a local capability rather than a remote
+# API, which is the point: the tool/daemon/skill model does not assume HTTP.
 #
-# READ THIS BEFORE USING IT
+# Relay executes it through the LocalExecutor. Each operation's request block
+# names the local primitive to run in request.operation; a local request has no
+# method, path, or baseUrl, because it contacts no service.
 #
-# This manifest is well-formed and builds, but it is not yet executable. Relay
-# ships only the REST executor today; there is no LocalExecutor, so invoking any
-# operation below fails with PROTOCOL_ERROR (spec 19, 46). The manifest states
-# the intended capability model so the shape is reviewable; it does not perform
-# filesystem I/O.
-#
-# The request blocks are placeholders. The current relay/v1 validator requires
-# every operation to declare request.method and request.path (spec 59), even for
-# a non-REST protocol. The values below are nominal identifiers, not URLs; a
-# future local executor would interpret the operation's inputs directly. Do not
-# read them as an HTTP contract.
+# Access is bounded by the declared permissions.filesystem scopes below. Before
+# an operation runs, the daemon resolves the path it names — expanding ~ and
+# following symlinks — and refuses the call unless a declared scope contains the
+# resolved path (spec 24, 25, 40).
 apiVersion: relay/v1
 kind: Tool
 metadata:
   name: filesystem
-  version: 0.1.0
-  description: Local filesystem capabilities — read, write, list, and delete
+  version: 0.2.0
+  description: Local filesystem capabilities — read, write, list, and stat
 
 runtime:
   name: relay
@@ -63,8 +58,7 @@ tools:
       required:
         - path
     request:
-      method: GET
-      path: /read_file
+      operation: read_file
 
   - name: write_file
     description: Write content to a file, creating or overwriting it
@@ -77,6 +71,13 @@ tools:
         content:
           type: string
           description: Content to write
+        encoding:
+          type: string
+          description: How to interpret content; base64 for binary payloads
+          enum:
+            - utf-8
+            - base64
+          default: utf-8
         create_dirs:
           type: boolean
           description: Create missing parent directories
@@ -85,8 +86,7 @@ tools:
         - path
         - content
     request:
-      method: PUT
-      path: /write_file
+      operation: write_file
 
   - name: list_directory
     description: List the entries of a directory
@@ -106,23 +106,17 @@ tools:
       required:
         - path
     request:
-      method: GET
-      path: /list_directory
+      operation: list_directory
 
-  - name: delete_file
-    description: Delete a file or, with recursive, a directory tree
+  - name: stat
+    description: Report metadata for a path without reading its content
     input:
       type: object
       properties:
         path:
           type: string
-          description: Absolute path or ~-relative path to remove
-        recursive:
-          type: boolean
-          description: Remove directories and their contents
-          default: false
+          description: Absolute path or ~-relative path to inspect
       required:
         - path
     request:
-      method: DELETE
-      path: /delete_file
+      operation: stat

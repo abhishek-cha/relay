@@ -261,6 +261,7 @@ relay/
 │   ├── protocol/
 │   │   ├── rest/       # REST executor
 │   │   ├── graphql/    # GraphQL executor
+│   │   ├── local/      # LocalExecutor (filesystem, git)
 │   │   └── grpc/
 │   ├── mcp/
 │   ├── telemetry/
@@ -277,7 +278,7 @@ relay/
 ├── examples/
 │   ├── github/         # github.yaml + SKILL.md (canonical pair)
 │   ├── slack/          # slack.yaml + SKILL.md
-│   ├── filesystem/     # filesystem.yaml + SKILL.md (local, not executable yet)
+│   ├── filesystem/     # filesystem.yaml + SKILL.md (local capability)
 │   └── stripe/         # stripe.yaml (manifest-only draft)
 │
 ├── skills/
@@ -801,7 +802,13 @@ GraphQL is implemented today:
 protocol:
   type: graphql
 
-gRPC is not:
+The local capability family is implemented too, so a tool can describe the
+machine it runs on rather than a remote API (spec 46):
+
+protocol:
+  type: local
+
+gRPC and browser are not:
 
 protocol:
   type: grpc
@@ -1594,34 +1601,91 @@ The capability abstraction remains identical.
 
 ⸻
 
-46. Future Local Capabilities
+46. Local Capabilities
 
-Relay should eventually support tools that do not represent remote APIs.
-
-Examples:
+Relay supports tools that do not represent remote APIs. A local tool has no
+service to contact: its manifest declares `protocol.type: local`, and each
+operation's request block names the local primitive it runs. The built-in
+LocalExecutor implements two families today:
 
 filesystem
-browser
-git
-docker
-kubectl
-ssh
-macOS notifications
-calendar
-clipboard
-local databases
-
-Example:
+ ├── read_file
+ ├── write_file
+ ├── list_directory
+ └── stat
 
 git
  ├── status
  ├── diff
- ├── log
- └── commit
+ └── log
 
-This is why the product should not be called something API-specific.
+The filesystem operations call the Go standard library in-process. The git
+operations invoke the `git` binary as a read-only inspection of a working tree;
+the binary is executed directly with an argument vector, never through a shell,
+and optional index locks and external diff/textconv helpers are disabled so a
+read cannot mutate the repository.
 
-Relay becomes a capability layer, not an API wrapper.
+Manifest shape. A local request names an operation instead of a transport, so it
+carries `operation` and none of the REST fields (method, path) or the GraphQL
+fields (document, variables). The validator rejects the other protocols' fields
+on a local request rather than ignoring them, and rejects `protocol.baseUrl`.
+
+Example:
+
+apiVersion: relay/v1
+kind: Tool
+metadata:
+  name: filesystem
+  version: 0.2.0
+  description: Local filesystem capabilities — read, write, list, and stat
+
+protocol:
+  type: local
+
+capabilities:
+  - filesystem.read
+  - filesystem.write
+
+permissions:
+  filesystem:
+    read:
+      - "~/Documents"
+      - "~/Desktop"
+    write:
+      - "~/Documents"
+
+tools:
+  - name: read_file
+    description: Read the contents of a single file
+    input:
+      type: object
+      properties:
+        path:
+          type: string
+      required:
+        - path
+    request:
+      operation: read_file
+
+The operation's name is carried in the protocol-neutral `Spec.Endpoint` slot, so
+the daemon, and therefore the CLI and MCP surfaces, reach a local operation
+through the identical path they use for REST and GraphQL. The generated CLI does
+not change and the MCP representation does not change; only the executor does.
+
+Security. The daemon remains the security boundary (spec 24, 40). Before a local
+operation runs, the daemon derives the concrete path from the operation input,
+resolves it — expanding a leading tilde and following symbolic links — and
+checks it against the declared `permissions.filesystem` scopes. Because a
+symlink is resolved before the check, a link that sits inside a declared scope
+but points outside it is refused: the check sees the real target, not the link.
+The executor resolves the target by the same rule, so the path that was
+authorized and the path that is acted on are identical. A local tool that
+declares no filesystem capability is refused outright, the correct default-deny
+reading. Output is capped at 8 MiB, matching the IPC and MCP frame limits, so an
+operation cannot hand the transport a result it could not carry.
+
+This is why the product should not be called something API-specific. Relay is a
+capability layer, not an API wrapper.
 
 ⸻
 
