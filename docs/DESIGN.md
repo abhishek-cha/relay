@@ -1641,7 +1641,7 @@ Only the protocol executor changes.
 
 Implemented by GRPCExecutor behind the same protocol.Executor seam as REST and
 GraphQL. The server address comes from the protocol block, and each operation
-names its method as the canonical gRPC path in the request block:
+names its method literally in the request block:
 
 protocol:
   type: grpc
@@ -1657,8 +1657,17 @@ tools:
       required:
         - id
     request:
-      method: POST
-      path: /example.user.UserService/GetUser
+      package: example.user
+      service: UserService
+      method: GetUser
+
+request.package and request.service name the service the way the protocol block
+names a service, and request.method names the RPC method; together they address
+/package.Service/Method. The three are meaningful only for protocol.type grpc,
+must be declared together, and must not be combined with request.path. An
+operation may instead keep addressing its method by the canonical path in
+request.path, so a manifest written before these fields existed is unchanged;
+the validator rejects declaring both forms at once as ambiguous.
 
 The executor resolves the request and response message descriptors through
 server reflection at call time, so a tool needs no generated Go stubs. It sends

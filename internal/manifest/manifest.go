@@ -119,8 +119,19 @@ type Property struct {
 // uses Operation (spec §19, §20, §44, §46). The shapes coexist: a manifest sets
 // only the fields its protocol reads, and the validator rejects the others.
 type Request struct {
-	Method  string            `yaml:"method,omitempty" json:"method,omitempty"`
-	Path    string            `yaml:"path,omitempty" json:"path,omitempty"`
+	// Method is the HTTP verb for a REST request. A gRPC operation has no HTTP
+	// verb, so the literal gRPC form described below reads it as the RPC method
+	// name instead (spec §45).
+	Method string `yaml:"method,omitempty" json:"method,omitempty"`
+	Path   string `yaml:"path,omitempty" json:"path,omitempty"`
+
+	// Package and Service name a gRPC method literally, the way the protocol
+	// block names a service (spec §45). Together with Method they address
+	// /package.Service/Method without smuggling the whole path into request.path.
+	// They are meaningful only for protocol.type grpc: a gRPC operation declares
+	// either this triple or request.path, never both.
+	Package string            `yaml:"package,omitempty" json:"package,omitempty"`
+	Service string            `yaml:"service,omitempty" json:"service,omitempty"`
 	Query   map[string]string `yaml:"query,omitempty" json:"query,omitempty"`
 	Headers map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
 	Body    any               `yaml:"body,omitempty" json:"body,omitempty"`

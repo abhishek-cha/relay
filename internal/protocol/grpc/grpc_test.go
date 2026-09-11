@@ -399,3 +399,110 @@ func TestParseMethodPath(t *testing.T) {
 		}
 	}
 }
+
+// TestLiteralMethodMatchesPath proves an operation that names its gRPC method
+// with the literal package/service/method triple resolves and calls the same
+// method as one that smuggles the canonical path into request.path (spec §45).
+func TestLiteralMethodMatchesPath(t *testing.T) {
+	address, _ := startTestServer(t)
+	executor := New()
+
+	pathResponse, err := executor.Execute(context.Background(), protocol.Request{
+		Spec: protocol.Spec{
+			Type:    "grpc",
+			BaseURL: address,
+			Path:    echoMethodPath,
+			Body:    map[string]any{"message": "hello"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("path-addressed call failed: %v", err)
+	}
+
+	literalResponse, err := executor.Execute(context.Background(), protocol.Request{
+		Spec: protocol.Spec{
+			Type:    "grpc",
+			BaseURL: address,
+			Package: testPackage,
+			Service: "EchoService",
+			Method:  "Echo",
+			Body:    map[string]any{"message": "hello"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("literal-addressed call failed: %v", err)
+	}
+
+	pathBody := pathResponse.Body.(map[string]any)
+	literalBody := literalResponse.Body.(map[string]any)
+	if literalBody["message"] != pathBody["message"] {
+		t.Errorf("literal body %v differs from path body %v", literalBody["message"], pathBody["message"])
+	}
+	if literalBody["message"] != "echo:hello" {
+		t.Errorf("literal message = %v, want echo:hello", literalBody["message"])
+	}
+}
+
+// TestResolveMethod covers the two addressing forms and the malformed literal
+// block they share (spec §45).
+func TestResolveMethod(t *testing.T) {
+	tests := []struct {
+		name    string
+		spec    protocol.Spec
+		full    string
+		service string
+		method  string
+		wantErr bool
+	}{
+		{
+			name:    "path fallback",
+			spec:    protocol.Spec{Path: echoMethodPath},
+			full:    echoMethodPath,
+			service: testService,
+			method:  "Echo",
+		},
+		{
+			name:    "path fallback ignores legacy http verb",
+			spec:    protocol.Spec{Method: "POST", Path: echoMethodPath},
+			full:    echoMethodPath,
+			service: testService,
+			method:  "Echo",
+		},
+		{
+			name:    "literals assemble the canonical path",
+			spec:    protocol.Spec{Package: testPackage, Service: "EchoService", Method: "Echo"},
+			full:    echoMethodPath,
+			service: testService,
+			method:  "Echo",
+		},
+		{
+			name:    "literals without a service",
+			spec:    protocol.Spec{Package: testPackage, Method: "Echo"},
+			wantErr: true,
+		},
+		{
+			name:    "literals without a method",
+			spec:    protocol.Spec{Package: testPackage, Service: "EchoService"},
+			wantErr: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			full, service, method, err := resolveMethod(test.spec)
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("resolveMethod(%+v) = no error, want error", test.spec)
+				}
+				requireCode(t, err, relay.CodeProtocolError)
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveMethod(%+v) error: %v", test.spec, err)
+			}
+			if full != test.full || service != test.service || method != test.method {
+				t.Errorf("resolveMethod(%+v) = (%q, %q, %q), want (%q, %q, %q)",
+					test.spec, full, service, method, test.full, test.service, test.method)
+			}
+		})
+	}
+}

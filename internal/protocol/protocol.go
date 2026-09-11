@@ -45,11 +45,18 @@ type Spec struct {
 	Type     string // rest | graphql | grpc | browser | local
 	BaseURL  string
 	Endpoint string
-	Method   string
-	Path     string
-	Query    map[string]string
-	Headers  map[string]string
-	Body     any
+	// Method and Path are the REST HTTP verb and URL path. For a gRPC operation
+	// addressed by name (spec §45), Package and Service carry the service and
+	// Method carries the RPC method name, while Path stays empty; a gRPC
+	// operation addressed by path leaves Package and Service empty and puts the
+	// canonical /package.Service/Method in Path, as before.
+	Method  string
+	Path    string
+	Package string
+	Service string
+	Query   map[string]string
+	Headers map[string]string
+	Body    any
 
 	// Document is the GraphQL operation text (a query or mutation) and
 	// Variables maps a GraphQL variable name to the operation input property

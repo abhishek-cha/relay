@@ -490,6 +490,10 @@ func (d *Daemon) serverInfo() relay.ServerInfo {
 // takes its endpoint from the protocol block; a local capability has no
 // address, so it carries the primitive to run — the manifest's
 // request.operation — in that slot (spec §46).
+//
+// Package and Service carry a gRPC operation's literal method addressing when
+// the manifest declares it (spec §45); for a path-addressed operation they stay
+// empty and the executor reads Path. Every other protocol leaves them empty.
 func specFor(doc *manifest.Document, operation *manifest.Tool) protocol.Spec {
 	endpoint := doc.Protocol.Endpoint
 	if doc.Protocol.Type == "local" {
@@ -501,6 +505,8 @@ func specFor(doc *manifest.Document, operation *manifest.Tool) protocol.Spec {
 		Endpoint: endpoint,
 		Method:   operation.Request.Method,
 		Path:     operation.Request.Path,
+		Package:  operation.Request.Package,
+		Service:  operation.Request.Service,
 		Query:    operation.Request.Query,
 		Headers:  operation.Request.Headers,
 		Body:     operation.Request.Body,

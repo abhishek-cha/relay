@@ -477,3 +477,119 @@ func TestValidateAggregatesLocalProblems(t *testing.T) {
 		t.Fatalf("expected 3 problems, got %d: %v", len(validationErr.Problems), validationErr.Problems)
 	}
 }
+
+// grpcLiteralManifest names its method with the literal package/service/method
+// triple instead of the canonical path (spec §45).
+const grpcLiteralManifest = "apiVersion: relay/v1\n" +
+	"kind: Tool\n" +
+	"metadata:\n" +
+	"  name: demo\n" +
+	"  version: 1.0.0\n" +
+	"  description: A demo tool\n" +
+	"protocol:\n" +
+	"  type: grpc\n" +
+	"  endpoint: localhost:50051\n" +
+	"tools:\n" +
+	"  - name: get_user\n" +
+	"    description: Get a user\n" +
+	"    input:\n" +
+	"      type: object\n" +
+	"    request:\n" +
+	"      package: example.user\n" +
+	"      service: UserService\n" +
+	"      method: GetUser\n"
+
+// grpcPathManifest addresses its method the original way, as the canonical path
+// in request.path, and must keep validating unchanged (spec §45).
+const grpcPathManifest = "apiVersion: relay/v1\n" +
+	"kind: Tool\n" +
+	"metadata:\n" +
+	"  name: demo\n" +
+	"  version: 1.0.0\n" +
+	"  description: A demo tool\n" +
+	"protocol:\n" +
+	"  type: grpc\n" +
+	"  endpoint: localhost:50051\n" +
+	"tools:\n" +
+	"  - name: get_user\n" +
+	"    description: Get a user\n" +
+	"    input:\n" +
+	"      type: object\n" +
+	"    request:\n" +
+	"      method: POST\n" +
+	"      path: /example.user.UserService/GetUser\n"
+
+func TestValidateAcceptsGRPCMethodAddressing(t *testing.T) {
+	tests := []struct {
+		name string
+		text string
+	}{
+		{"literals", grpcLiteralManifest},
+		{"path", grpcPathManifest},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := mustParse(t, test.text).Validate(); err != nil {
+				t.Fatalf("expected valid manifest, got: %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateRejectsGRPCMethodAddressing(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*Document)
+		wantErr string
+	}{
+		{
+			name:    "missing package",
+			mutate:  func(d *Document) { d.Tools[0].Request.Package = "" },
+			wantErr: "request.package: required when addressing a gRPC method by name",
+		},
+		{
+			name:    "missing service",
+			mutate:  func(d *Document) { d.Tools[0].Request.Service = "" },
+			wantErr: "request.service: required when addressing a gRPC method by name",
+		},
+		{
+			name:    "missing method",
+			mutate:  func(d *Document) { d.Tools[0].Request.Method = "" },
+			wantErr: "request.method: required when addressing a gRPC method by name",
+		},
+		{
+			name: "both forms declared",
+			mutate: func(d *Document) {
+				d.Tools[0].Request.Path = "/example.user.UserService/GetUser"
+			},
+			wantErr: "request.path: not allowed together with request.package/request.service/request.method",
+		},
+		{
+			name:    "segment carries a slash",
+			mutate:  func(d *Document) { d.Tools[0].Request.Service = "User/Service" },
+			wantErr: "request.service",
+		},
+		{
+			name: "literals on a non-grpc protocol",
+			mutate: func(d *Document) {
+				d.Protocol.Type = "rest"
+				d.Protocol.BaseURL = "https://example.test"
+			},
+			wantErr: "request.package: not allowed for rest",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			doc := mustParse(t, grpcLiteralManifest)
+			test.mutate(doc)
+			err := doc.Validate()
+			if err == nil {
+				t.Fatalf("expected an error mentioning %q", test.wantErr)
+			}
+			if !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("expected error to mention %q, got: %v", test.wantErr, err)
+			}
+		})
+	}
+}

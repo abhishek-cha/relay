@@ -8,9 +8,11 @@
 // as protojson, giving the daemon, CLI, and MCP surfaces the same JSON shape
 // REST and GraphQL already return.
 //
-// The gRPC method is named in the operation's request block as the canonical
-// gRPC path, /package.Service/Method, and the server address comes from the
-// protocol block's baseUrl or endpoint. The capability model is untouched:
+// The server address comes from the protocol block's baseUrl or endpoint, and
+// the gRPC method is named in the operation's request block either literally as
+// request.package / request.service / request.method, which the executor
+// assembles into /package.Service/Method, or as that canonical path in
+// request.path, which it parses as before. The capability model is untouched:
 // this package only adds an Executor (spec §44, §45).
 //
 // See TASKS.md milestone M10.

@@ -132,12 +132,29 @@ func (d *Document) Validate() error {
 
 // validateRequest checks the shape of a single operation's request block. The
 // rules are protocol-specific: REST resolves path/query/header templates,
-// GraphQL posts a document plus variable bindings, and a local capability names
-// the primitive it runs (spec §19, §20, §44, §46). A protocol that still has no
-// defined request shape (grpc, browser) is checked against the REST rules,
-// which keeps those manifests loadable until their executors define a shape.
+// gRPC names its method by path or by literal package/service/method, GraphQL
+// posts a document plus variable bindings, and a local capability names the
+// primitive it runs (spec §19, §20, §44, §45, §46). Browser, which still has no
+// defined request shape, is checked against the REST rules, which keeps those
+// manifests loadable until its executor defines a shape.
 func validateRequest(where, protocolType string, tool Tool, add func(string, ...any)) {
+	// request.package and request.service address a gRPC method by name
+	// (spec §45). They are meaningful only for grpc, so a manifest that declares
+	// them on any other protocol is rejected rather than silently ignored.
+	// request.method cannot be checked here: it is every REST operation's HTTP
+	// verb, so only the two new fields are unambiguous on a non-gRPC protocol.
+	if protocolType != "grpc" {
+		if tool.Request.Package != "" {
+			add("%s.request.package: not allowed for %s; it addresses a gRPC method", where, protocolType)
+		}
+		if tool.Request.Service != "" {
+			add("%s.request.service: not allowed for %s; it addresses a gRPC method", where, protocolType)
+		}
+	}
+
 	switch protocolType {
+	case "grpc":
+		validateGRPCRequest(where, tool, add)
 	case "graphql":
 		validateGraphQLRequest(where, tool, add)
 		rejectPagination("graphql", where, tool, add)
@@ -148,6 +165,63 @@ func validateRequest(where, protocolType string, tool Tool, add func(string, ...
 		validateRESTRequest(where, tool, add)
 		validatePagination(where, tool, add)
 	}
+}
+
+// validateGRPCRequest checks how an operation addresses its gRPC method
+// (spec §45). A gRPC call has no HTTP verb, so an operation may either keep the
+// path-addressed form — request.method as the vestigial HTTP verb plus
+// request.path as /package.Service/Method, exactly as before — or declare the
+// literal triple request.package / request.service / request.method, naming the
+// method the way the protocol block names a service. The two forms are mutually
+// exclusive: declaring both is ambiguous and is rejected rather than silently
+// picking one, so a manifest always says exactly where its method lives.
+//
+// request.method carries the RPC method name in the literal form because there
+// is no HTTP verb for it to carry. A method set alongside a path is the legacy
+// HTTP verb, not a literal gRPC method name, which keeps every path-addressed
+// operation valid unchanged.
+func validateGRPCRequest(where string, tool Tool, add func(string, ...any)) {
+	request := tool.Request
+	literal := request.Package != "" || request.Service != "" ||
+		(request.Method != "" && request.Path == "")
+	if !literal {
+		// Path-addressed: today's shape, unchanged.
+		validateRESTRequest(where, tool, add)
+		validatePagination(where, tool, add)
+		return
+	}
+
+	if request.Path != "" {
+		add("%s.request.path: not allowed together with request.package/request.service/request.method; declare the literal method or the path, not both", where)
+	}
+	if request.Package == "" {
+		add("%s.request.package: required when addressing a gRPC method by name", where)
+	}
+	if request.Service == "" {
+		add("%s.request.service: required when addressing a gRPC method by name", where)
+	}
+	if request.Method == "" {
+		add("%s.request.method: required when addressing a gRPC method by name", where)
+	}
+
+	// The three must assemble into the canonical /package.Service/Method, so
+	// none may itself be empty or carry a separator the assembled path would
+	// misread.
+	segments := []struct {
+		field string
+		value string
+	}{
+		{"package", request.Package},
+		{"service", request.Service},
+		{"method", request.Method},
+	}
+	for _, segment := range segments {
+		if segment.value != "" && strings.ContainsAny(segment.value, "/ \t") {
+			add("%s.request.%s: %q must not contain '/', a space, or a tab", where, segment.field, segment.value)
+		}
+	}
+
+	validatePagination(where, tool, add)
 }
 
 // rejectPagination refuses a pagination block on a protocol that cannot act on

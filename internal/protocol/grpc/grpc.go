@@ -57,7 +57,7 @@ func (e *Executor) Execute(ctx context.Context, req protocol.Request) (protocol.
 		)
 	}
 
-	fullMethod, service, method, err := parseMethodPath(spec.Path)
+	fullMethod, service, method, err := resolveMethod(spec)
 	if err != nil {
 		return protocol.Response{}, err
 	}
@@ -156,6 +156,30 @@ func (e *Executor) dial(address string) (*grpc.ClientConn, error) {
 		}
 	}
 	return grpc.NewClient(target, options...)
+}
+
+// resolveMethod names the gRPC method to call. An operation that named its
+// method literally (spec §45) carries Package, Service, and the RPC method name
+// in Method, so the executor assembles /package.Service/Method from them. An
+// operation addressed by path carries the canonical path in Path and is parsed
+// exactly as before, so path-addressed manifests keep working unchanged.
+func resolveMethod(spec protocol.Spec) (full, service, method string, err error) {
+	if spec.Package != "" || spec.Service != "" {
+		if spec.Package == "" || spec.Service == "" || spec.Method == "" {
+			return "", "", "", relay.NewError(
+				relay.CodeProtocolError,
+				"grpc operation must declare request.package, request.service, and request.method together",
+			).WithDetails(map[string]any{
+				"package": spec.Package,
+				"service": spec.Service,
+				"method":  spec.Method,
+			})
+		}
+		service = spec.Package + "." + spec.Service
+		method = spec.Method
+		return "/" + service + "/" + method, service, method, nil
+	}
+	return parseMethodPath(spec.Path)
 }
 
 // parseMethodPath splits a canonical gRPC method path, /package.Service/Method,
