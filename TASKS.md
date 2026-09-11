@@ -120,13 +120,22 @@ Break any of these and the product stops being Relay.
 
 **Goal:** REST is the first protocol, behind `Executor`.
 
-- [ ] `RESTExecutor`: GET/POST/PUT/PATCH/DELETE; path templating from input; query params; headers; JSON body; JSON response
-- [ ] Method, path, query, headers, and body declared in the manifest; response mapped to the JSON result
-- [ ] Response body is parsed as JSON when the content type says so, with a raw fallback
-- [ ] Structured errors (§26): map status/transport failures → `AUTH_REQUIRED`, `AUTH_FAILED`, `PERMISSION_DENIED`, `RATE_LIMITED`, `REMOTE_ERROR`, `NETWORK_ERROR`, `TIMEOUT`
-- [ ] Context timeouts and cancellation; retry/backoff for 429/5xx honoring `Retry-After`, bounded attempts
+- [x] `RESTExecutor`: GET/POST/PUT/PATCH/DELETE; path templating from input; query params; headers; JSON body; JSON response
+- [x] Method, path, query, headers, and body declared in the manifest; response mapped to the JSON result
+- [x] Response body is parsed as JSON when the content type says so, with a raw fallback
+- [x] Structured errors (§26): map status/transport failures → `AUTH_REQUIRED`, `AUTH_FAILED`, `PERMISSION_DENIED`, `RATE_LIMITED`, `REMOTE_ERROR`, `NETWORK_ERROR`, `TIMEOUT`
+- [x] Context timeouts and cancellation; retry/backoff for 429/5xx honoring `Retry-After`, bounded attempts
 - [ ] Pagination (§20): a declared strategy (Link header and cursor param at minimum)
-- [ ] Protocol dispatch from `protocol.type`; unknown or unimplemented type → `PROTOCOL_ERROR`
+      Deferred on purpose: the manifest has no pagination block yet, so there is
+      nothing for a tool to declare. The executor performs one request; Link-header
+      and cursor strategies land together with the manifest field that expresses them.
+- [x] Protocol dispatch from `protocol.type`; unknown or unimplemented type → `PROTOCOL_ERROR`
+
+**Notes.** Retries are limited to idempotent methods (GET/HEAD/PUT/DELETE); a POST is
+never replayed, because a duplicate write is worse than a failed one. `Retry-After`
+is honoured in its delay-seconds form (capped); the HTTP-date form is not parsed yet.
+Path placeholders are `url.PathEscape`d, while query and header values are substituted
+raw so `url.Values.Encode` owns query encoding.
 
 **Acceptance:** `github get_repository` and `list_pull_requests` work against GitHub (or a mock); the error taxonomy is verified against mocked 401/403/404/429/500.
 
@@ -273,7 +282,11 @@ GraphQL and gRPC alongside REST · complex GUI · multi-user permissions.
 5. **OAuth flow** — device code vs PKCE vs browser handoff; decide in M4 and reuse the browser capability later.
 6. **Config format** — pick TOML, YAML, or JSON for `~/.relay/config` in M7.
 7. **Binary size** — generic runtime plus embedded assets; confirm a few MB is acceptable.
-8. **Query/body templating** — the draft `slack` and `stripe` examples bind query values with `{param}`; confirm in M3 that path, query, headers, and body share one substitution convention.
+8. **Query/body templating** — RESOLVED in M3. Path, query, and header values all
+   substitute `{param}` from the operation input. Path segments are `url.PathEscape`d
+   (so a value cannot rewrite the path), while query and header values are substituted
+   raw and then encoded by `url.Values.Encode`. A requested query parameter whose input
+   is absent is omitted rather than sent empty.
 
 ## Risks
 
