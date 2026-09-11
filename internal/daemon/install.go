@@ -2,16 +2,14 @@ package daemon
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 
 	"relay/internal/fsutil"
 	"relay/internal/registry"
+	"relay/internal/sign"
 	"relay/pkg/relay"
 )
 
@@ -43,6 +41,19 @@ func (d *Daemon) register(ctx context.Context, request relay.RegisterRequest) re
 	descriptor, failure := d.readDescriptor(ctx, source)
 	if failure != nil {
 		return failedMutation(failure)
+	}
+
+	// Trust is decided before anything is copied. A signature that fails to
+	// verify, or a tool the local policy blocks, must leave no debris behind
+	// (spec §48, §49).
+	trust, failure := d.resolveTrust(ctx, source, descriptor)
+	if failure != nil {
+		return failedMutation(failure)
+	}
+	if trust == sign.TrustBlocked {
+		return failedMutation(relay.NewError(sign.CodeToolBlocked,
+			fmt.Sprintf("%s is blocked by the local trust policy", descriptor.Name)).
+			WithDetails(map[string]any{"tool": descriptor.Name, "trust": string(trust)}))
 	}
 
 	if err := d.layout.Ensure(); err != nil {
@@ -92,7 +103,7 @@ func (d *Daemon) register(ctx context.Context, request relay.RegisterRequest) re
 		installation.InstalledAt = previous.InstalledAt
 	}
 
-	if err := d.store.Put(installation); err != nil {
+	if err := d.store.PutSigned(installation, trust); err != nil {
 		return failedMutation(relay.NewError(relay.CodeRemoteError, err.Error()))
 	}
 
@@ -223,15 +234,65 @@ func operationNames(descriptor relay.Descriptor) []string {
 // hashFile returns the SHA-256 of a file, so a binary swapped after
 // registration is visible rather than silently trusted (spec §16).
 func hashFile(path string) (string, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer file.Close()
+	return sign.DigestFile(path)
+}
 
-	digest := sha256.New()
-	if _, err := io.Copy(digest, file); err != nil {
-		return "", err
+// resolveTrust decides a tool's trust level before it is installed (spec §48,
+// §49).
+//
+// A signature is verified first and refused on any failure, because a signature
+// that does not bind the binary is worse than none: it looks like evidence while
+// proving nothing. Only once the artifact is either correctly signed or
+// genuinely unsigned does the local policy decide the level.
+func (d *Daemon) resolveTrust(ctx context.Context, source string, descriptor relay.Descriptor) (sign.TrustLevel, *relay.Error) {
+	policy, err := sign.LoadPolicy(d.layout.Config)
+	if err != nil {
+		return "", relay.NewError(relay.CodeRemoteError, err.Error())
 	}
-	return hex.EncodeToString(digest.Sum(nil)), nil
+
+	identity := sign.Identity{Name: descriptor.Name}
+	signed := false
+	if signaturePath := sign.SignaturePath(source); fileExists(signaturePath) {
+		signature, err := sign.Load(signaturePath)
+		if err != nil {
+			return "", signatureRefused(descriptor.Name, err)
+		}
+		// The signed bytes are the exact bytes the tool emits, so the daemon asks
+		// the tool rather than re-encoding a parsed copy.
+		manifest, failure := d.run(ctx, source, "--manifest")
+		if failure != nil {
+			return "", failure
+		}
+		describe, failure := d.run(ctx, source, "--describe")
+		if failure != nil {
+			return "", failure
+		}
+		digest, err := sign.DigestFile(source)
+		if err != nil {
+			return "", relay.NewError(relay.CodeRemoteError,
+				fmt.Sprintf("hash %s for signature verification: %v", source, err))
+		}
+		if err := signature.Verify(descriptor.Name, descriptor.Version, manifest, describe, digest); err != nil {
+			return "", signatureRefused(descriptor.Name, err)
+		}
+		signed = true
+		identity.Publisher = signature.Publisher
+		identity.KeyFingerprint = signature.KeyFingerprint
+	}
+
+	return sign.Decide(policy, identity, signed), nil
+}
+
+// signatureRefused reports a signature that could not be trusted. The underlying
+// reason is carried because it is what tells a publisher their build drifted.
+func signatureRefused(name string, err error) *relay.Error {
+	return relay.NewError(sign.CodeSignatureInvalid,
+		fmt.Sprintf("%s: signature verification failed: %v", name, err)).
+		WithDetails(map[string]any{"tool": name})
+}
+
+// fileExists reports whether path names an existing non-directory file.
+func fileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
 }

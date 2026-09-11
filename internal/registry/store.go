@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"relay/internal/fsutil"
+	"relay/internal/sign"
 	"relay/pkg/relay"
 )
 
@@ -90,12 +91,19 @@ func (s *Store) Get(name string) (relay.Installation, error) {
 	return installation, nil
 }
 
-// Put writes one record atomically.
+// Put writes one record atomically. It records no trust level, which reads back
+// as TrustUnknown; callers that know a tool's trust use PutSigned.
 func (s *Store) Put(installation relay.Installation) error {
+	return s.put(installation, "")
+}
+
+// put writes one record and its trust level atomically.
+func (s *Store) put(installation relay.Installation, trust sign.TrustLevel) error {
 	if !ValidName(installation.Name) {
 		return fmt.Errorf("invalid tool name %q", installation.Name)
 	}
-	encoded, err := json.MarshalIndent(installation, "", "  ")
+	record := storedRecord{Installation: installation, TrustLevel: trust}
+	encoded, err := json.MarshalIndent(record, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode registry record: %w", err)
 	}
