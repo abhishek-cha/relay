@@ -25,10 +25,10 @@ Break any of these and the product stops being Relay.
 
 ## Prerequisites
 
-- [ ] Go toolchain (1.22+) — **not installed on this machine** (`go: command not found`); `brew install go`
-- [ ] `go mod tidy` to generate `go.sum` (the scaffold ships `go.mod` only)
-- [ ] `go build ./...` and `go test ./...` pass
-- [ ] Decide the module path. The scaffold uses the local `relay`; move to `github.com/<you>/relay` before publishing.
+- [x] Go toolchain (1.22+) — installed at `/usr/local/go/bin/go` (Go 1.27.1)
+- [x] `go mod tidy` to generate `go.sum` (the scaffold ships `go.mod` only)
+- [x] `go build ./...` and `go test ./...` pass
+- [ ] Decide the module path. The scaffold uses the local `relay`; move to `github.com/<you>/relay` before publishing. (open decision #1)
 
 ---
 
@@ -42,9 +42,9 @@ Break any of these and the product stops being Relay.
 - [x] `protocol.Executor` seam (`internal/protocol`)
 - [x] Public wire types + error codes (`pkg/relay`)
 - [x] Stub entrypoints for `relay`, `relayd`, `relay-tool`
-- [ ] `go mod tidy`; commit `go.sum`
-- [ ] `gofmt` / `go vet` clean; add a `Makefile` (`build`, `test`, `fmt`, `lint`)
-- [ ] CI: build + vet + test on push
+- [x] `go mod tidy`; commit `go.sum`
+- [x] `gofmt` / `go vet` clean; add a `Makefile` (`build`, `test`, `fmt`, `vet`, `e2e`, `tidy`, `clean`)
+- [x] CI: build + vet + test on push (`.github/workflows/ci.yml`)
 
 **Acceptance:** `go build ./...` succeeds; `go run ./cmd/relay version` prints a version.
 
@@ -54,23 +54,27 @@ Break any of these and the product stops being Relay.
 
 **Goal:** `relay build tool.yaml` produces one self-describing binary.
 
-- [ ] Complete manifest schema: `apiVersion`, `kind`, `metadata`, `runtime`, `protocol`, `auth`, `capabilities`, `permissions`, `tools[]`
-- [ ] Validation rules (§59): required fields; duplicate operation names; unknown protocol; unknown auth type; path param `{x}` must be a `required` input property; `apiVersion`/`kind` correctness; aggregate *all* errors in one report
-- [ ] Build pipeline (§12): parse → validate manifest → validate skill → package both → compile the generic runtime → embed → write `dist/<name>`
-- [ ] Embedding (§8): manifest + skill via `go:embed` into a per-tool build; keep the runtime generic in `cmd/relay-tool`
-- [ ] Binary contract (§9): `--describe` (JSON), `--skill`, `--help`, `--version`
-- [ ] CLI generation (§11): `snake_case` op → `kebab-case` verb; flags derived from `input.properties`; plus `--json`, `--input <file>`, `--input-json <json>`
-- [ ] Input validation against the operation's JSON schema; structured `INVALID_INPUT` on failure
-- [ ] Output contract (§10): result → stdout, logs → stderr, exit codes
-- [ ] `relay build github.yaml --skill ./SKILL.md`
+- [x] Complete manifest schema: `apiVersion`, `kind`, `metadata`, `runtime`, `protocol`, `auth`, `capabilities`, `permissions`, `tools[]` — `internal/manifest/manifest.go`
+- [x] Validation rules (§59): required fields; duplicate operation names; unknown protocol; unknown auth type; path param `{x}` must be a `required` input property; `apiVersion`/`kind` correctness; aggregate *all* errors in one report — `internal/manifest/validate.go` + `validate_test.go`
+- [x] Build pipeline (§12): parse → validate manifest → validate skill → package both → compile the generic runtime → embed → write `dist/<name>` — `internal/build/build.go`
+- [x] Embedding (§8): manifest + skill via `go:embed` into a per-tool build; keep the runtime generic in `pkg/toolruntime` — `internal/build/toolmain.go.tmpl`
+- [x] Binary contract (§9): `--describe` (JSON), `--skill`, `--help`, `--version` — `internal/runtime/runtime.go`
+- [x] CLI generation (§11): `snake_case` op → `kebab-case` verb; flags derived from `input.properties`; plus `--json`, `--input <file>`, `--input-json <json>` — `internal/runtime/flags.go`
+- [x] Input validation against the operation's JSON schema; structured `INVALID_INPUT` on failure
+- [x] Output contract (§10): result → stdout, logs → stderr, exit codes (`0` ok, `1` error, `2` usage)
+- [x] `relay build github.yaml --skill ./SKILL.md` — `cmd/relay/main.go`
+
+**Implemented in:** `internal/manifest`, `internal/skill`, `internal/runtime`, `internal/build`, `pkg/toolruntime`; end-to-end covered by `scripts/e2e.sh`.
 
 **Acceptance (§52, §60):**
 
-- `relay build examples/github/github.yaml --skill examples/github/SKILL.md` produces `dist/github`
-- `./dist/github --describe` returns valid JSON matching §9
-- `./dist/github --skill` returns the embedded `SKILL.md`
-- `--help` and `--version` behave
-- the binary works moved to a clean directory with no YAML or source present
+- [x] `relay build examples/github/github.yaml --skill examples/github/SKILL.md` produces `dist/github` (3.07 MB, `-trimpath -ldflags "-s -w"`)
+- [x] `./dist/github --describe` returns valid JSON matching §9
+- [x] `./dist/github --skill` returns the embedded `SKILL.md`
+- [x] `--help` and `--version` behave
+- [x] the binary works moved to a clean directory with no YAML or source present
+
+**Verified:** `make vet`, `go test ./...`, and `scripts/e2e.sh` (19/19) all pass at commit `729a62d`.
 
 ---
 
