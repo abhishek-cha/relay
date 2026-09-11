@@ -43,11 +43,12 @@ type Invoker interface {
 
 // App is a runnable tool binary.
 type App struct {
-	Manifest *manifest.Document
-	Skill    []byte
-	Invoker  Invoker
-	Stdout   io.Writer
-	Stderr   io.Writer
+	Manifest    *manifest.Document
+	RawManifest []byte
+	Skill       []byte
+	Invoker     Invoker
+	Stdout      io.Writer
+	Stderr      io.Writer
 }
 
 // New builds an App from embedded assets. It does not validate the manifest:
@@ -58,11 +59,12 @@ func New(assets Assets, invoker Invoker, stdout, stderr io.Writer) (*App, error)
 		return nil, err
 	}
 	return &App{
-		Manifest: doc,
-		Skill:    assets.Skill,
-		Invoker:  invoker,
-		Stdout:   stdout,
-		Stderr:   stderr,
+		Manifest:    doc,
+		RawManifest: assets.Manifest,
+		Skill:       assets.Skill,
+		Invoker:     invoker,
+		Stdout:      stdout,
+		Stderr:      stderr,
 	}, nil
 }
 
@@ -82,6 +84,8 @@ func (a *App) Run(ctx context.Context, args []string) int {
 	switch rest[0] {
 	case "--describe":
 		return a.describe()
+	case "--manifest":
+		return a.manifest()
 	case "--skill":
 		return a.skill()
 	case "--version":
@@ -129,6 +133,14 @@ func (a *App) Run(ctx context.Context, args []string) int {
 	}
 
 	return a.succeed(jsonOut, response.Result)
+}
+
+// manifest writes the raw embedded manifest bytes verbatim to stdout (spec §13,
+// §16). The binary is the authoritative schema source; this returns the exact
+// bytes embedded at build time with no re-encoding or JSON wrapper.
+func (a *App) manifest() int {
+	a.Stdout.Write(a.RawManifest)
+	return ExitOK
 }
 
 // describe prints the primary discovery and registration contract (spec §9).
@@ -284,7 +296,7 @@ func (a *App) usage() string {
 	}
 	builder.WriteString("\nUsage:\n")
 	fmt.Fprintf(&builder, "  %s <operation> [flags]\n", a.Manifest.Metadata.Name)
-	fmt.Fprintf(&builder, "  %s --describe | --skill | --version | --help\n", a.Manifest.Metadata.Name)
+	fmt.Fprintf(&builder, "  %s --describe | --manifest | --skill | --version | --help\n", a.Manifest.Metadata.Name)
 	builder.WriteString("\nGlobal flags:\n")
 	builder.WriteString("  --json    wrap results and errors in a JSON envelope\n")
 	builder.WriteString("\nOperations:\n")

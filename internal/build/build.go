@@ -17,6 +17,7 @@ import (
 	"text/template"
 
 	"relay/internal/manifest"
+	"relay/internal/paths"
 	"relay/internal/skill"
 )
 
@@ -117,6 +118,26 @@ func Build(ctx context.Context, opts Options) (*Result, error) {
 
 	if err := goBuild(ctx, workDir, outPath); err != nil {
 		return nil, err
+	}
+
+	// When the caller did not specify an explicit output path, also create a
+	// PATH shim in layout.Bin so the tool is reachable via the user's PATH
+	// (spec §38).  The shim is best-effort: a failure is reported on stderr
+	// when Verbose but must never fail the build.
+	if opts.OutPath == "" {
+		layout := paths.Default()
+		shim := layout.Shims(doc.Metadata.Name)
+		if err := os.MkdirAll(layout.Bin, 0o755); err != nil {
+			if opts.Verbose {
+				fmt.Fprintf(os.Stderr, "relay: warning: create bin directory: %v\n", err)
+			}
+		} else {
+			if err := os.Symlink(outPath, shim); err != nil {
+				if opts.Verbose {
+					fmt.Fprintf(os.Stderr, "relay: warning: create shim %s: %v\n", shim, err)
+				}
+			}
+		}
 	}
 
 	result := &Result{

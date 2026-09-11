@@ -82,16 +82,37 @@ Break any of these and the product stops being Relay.
 
 **Goal:** move execution behind the Unix-socket daemon.
 
-- [ ] `relayd`: socket at `~/.relay/run/daemon.sock`; JSON frames; create `~/.relay/{config,registry,run,logs,cache}`
-- [ ] IPC protocol (§14): `invoke` request/response, correlation IDs, version handshake; streaming not required for v1
-- [ ] Registry (§15, §16): `relay install ./github` runs `--describe`, validates the descriptor, checks runtime compatibility, copies the binary to `~/.relay/tools/`, writes `~/.relay/registry/<name>.json`
-- [ ] Registry is discovery-only; the binary stays authoritative for schemas — never serve a cached schema
-- [ ] Runtime compatibility (§35): reject incompatible `runtime.apiVersion` with `RUNTIME_INCOMPATIBLE`
-- [ ] Single-instance daemon (lock file); `relay daemon start|stop|status`; graceful shutdown on SIGTERM
-- [ ] Tool runtime routes through the daemon (§13); the tool binary executes nothing itself
-- [ ] `relay list` and `relay inspect <tool>` read the registry
+- [x] `relayd`: socket at `~/.relay/run/daemon.sock`; JSON frames; creates `~/.relay/{bin,cache,config,logs,registry,run,tools}` — `internal/daemon/server.go`, `internal/paths`, `cmd/relayd/main.go`
+- [x] IPC protocol (§14): `invoke` request/response, version handshake, and a small frame set (`hello`, `invoke`, `list`, `inspect`, `status`, `register`, `remove`) — `internal/ipc/ipc.go`, `pkg/relay/ipc.go`
+- [x] Registry (§15, §16): `relay install ./github` runs `--describe`, validates the descriptor, checks runtime compatibility, copies the binary to `~/.relay/tools/`, writes `~/.relay/registry/<name>.json`, and links the tool into `~/.relay/bin` (§38) — `internal/daemon/install.go`, `internal/registry`
+- [x] Registry is discovery-only; the binary stays authoritative for schemas — the daemon re-reads `--manifest`/`--describe` from the installed binary on every invoke/inspect and stores no schema (`Installation` carries operations only as a display summary)
+- [x] Runtime compatibility (§35): reject incompatible `runtime.apiVersion` with `RUNTIME_INCOMPATIBLE` — `pkg/relay/runtime.go`, `internal/daemon/tool.go` (`checkRuntime`, `validateDescriptor`)
+- [x] Single-instance daemon (flock on `run/daemon.lock`); `relay daemon start|stop|restart|status|install`; graceful shutdown on SIGTERM — `internal/ipc/flock_unix.go`, `cmd/relay/main.go`
+- [x] Tool runtime routes through the daemon (§13); the tool binary executes nothing itself — `pkg/toolruntime/toolruntime.go` dials the socket and sends `hello` + `invoke`
+- [x] `relay list` and `relay inspect <tool>` read the registry (with an on-disk fallback when the daemon is stopped) — `cmd/relay/main.go`
+- [x] `relay logs` tails the daemon log
 
-**Acceptance:** `relay install ./dist/github` registers the tool; `github get-repository --owner X --repo Y` routes through the daemon; a daemon restart preserves the registry.
+**Implemented in:** `internal/{ipc,paths,registry,fsutil,daemon}`, `pkg/relay/ipc.go`, `pkg/toolruntime`, `cmd/relayd`, `cmd/relay`.
+
+**Decisions taken:**
+
+- **IPC framing — newline-delimited JSON, no correlation IDs.** Callers are short-lived processes making a handful of sequential calls over one connection; pipelining would add correlation bookkeeping without buying anything. Open decision #4 is resolved for v1.
+- **One lock per Relay home, not per socket.** `--socket` moves where the daemon listens but not which home it owns, because the registry has exactly one writer. Installing a second daemon for one home fails cleanly rather than racing.
+- **Daemon re-validates input.** A tool binary is treated as untrusted, so the daemon re-runs the same schema validation the tool already did (§40).
+- **Only the copied binary and the PATH link are removed** by `relay uninstall`; the source a user installed from is never touched.
+
+**Acceptance (§53):**
+
+- [x] `relay install ./dist/github` registers the tool (registry record + `~/.relay/tools/github` + `~/.relay/bin/github` symlink)
+- [x] `github get-repository --owner X --repo Y` routes through the daemon; with no executor for `rest` yet it fails `PROTOCOL_ERROR` after passing schema validation (M3 adds the executor)
+- [x] The registry survives a daemon restart — it is plain JSON on disk, re-read at startup
+- [x] A second daemon on the same home exits 1 with a clean message; the first keeps serving
+
+**Verified:** `gofmt -l .` empty, `go build ./...`, `go vet ./...`, `go test ./...`, and `scripts/e2e.sh` (37/37) all pass.
+
+---
+
+
 
 ---
 

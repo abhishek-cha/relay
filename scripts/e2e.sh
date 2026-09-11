@@ -96,6 +96,120 @@ cp "$tool" "$moved"
 check "runs with no source tree present" "0" "$(cd "$workdir/elsewhere" && ./github --describe >/dev/null 2>&1; echo $?)"
 check "carries its own skill" "ok" "$(cd "$workdir/elsewhere" && ./github --skill | head -1 | grep -q '^# GitHub' && echo ok || echo bad)"
 
+echo "==> M2: daemon lifecycle"
+
+# Build the CLI and daemon once into the scratch dir.
+echo "    building relayd and relay"
+go build -o "$workdir/relayd" ./cmd/relayd
+go build -o "$workdir/relay" ./cmd/relay
+
+# Every daemon test uses its own RELAY_HOME so the user's real ~/.relay is
+# never touched.  The trap ensures the daemon is stopped and the temp home is
+# torn down even on early exit.
+RELAY_HOME="$(mktemp -d)"
+export RELAY_HOME
+trap '"$workdir/relay" daemon stop >/dev/null 2>&1 || true; rm -rf "$RELAY_HOME"' EXIT
+
+# Prepend the workdir so relay can find its sibling relayd.
+PATH="$workdir:$PATH"
+export PATH
+
+# --- 1. daemon start succeeds; socket exists ---
+echo "    daemon start"
+start_exit=$("$workdir/relay" daemon start >/dev/null 2>&1; echo $?)
+sleep 1
+check "daemon start exits 0" "0" "$start_exit"
+check "daemon socket exists" "yes" "$([ -S "$RELAY_HOME/run/daemon.sock" ] && echo yes || echo no)"
+
+# --- 2. daemon status exits 0 and parses as JSON ---
+echo "    daemon status"
+status_out=$("$workdir/relay" daemon status 2>/dev/null)
+status_exit=$?
+check "daemon status exits 0" "0" "$status_exit"
+check "daemon status is valid JSON" "ok" "$(echo "$status_out" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("ok" if "pid" in d and "version" in d else "bad:" + str(list(d.keys())))' 2>&1)"
+
+# --- 3. install registers the tool ---
+echo "    install"
+install_exit=$("$workdir/relay" install "$tool" >/dev/null 2>&1; echo $?)
+check "install exits 0" "0" "$install_exit"
+check "registry record exists" "yes" "$([ -f "$RELAY_HOME/registry/github.json" ] && echo yes || echo no)"
+check "installed binary exists and is executable" "yes" "$([ -x "$RELAY_HOME/tools/github" ] && echo yes || echo no)"
+
+# --- 4. list mentions github ---
+echo "    list"
+list_out=$("$workdir/relay" list 2>/dev/null)
+check "list exits 0" "0" "$?"
+check "list mentions github" "ok" "$(echo "$list_out" | grep -q github && echo ok || echo bad)"
+
+# --- 5. inspect parses as JSON with expected shape ---
+echo "    inspect"
+inspect_out=$("$workdir/relay" inspect github 2>/dev/null)
+check "inspect exits 0" "0" "$?"
+check "inspect shape" "ok" "$(echo "$inspect_out" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+names = [t["name"] for t in d.get("tools",[])]
+ok = d.get("name") == "github" and "get_repository" in names and "list_pull_requests" in names
+print("ok" if ok else "bad:name=" + str(d.get("name")) + " tools=" + str(names))
+' 2>&1)"
+
+# --- 6. registered tool routes through daemon, gets PROTOCOL_ERROR ---
+echo "    registered tool invocation"
+check "registered tool gets PROTOCOL_ERROR" "PROTOCOL_ERROR" \
+    "$("$RELAY_HOME/tools/github" get-repository --owner openai --repo relay 2>&1 >/dev/null | python3 -c 'import sys; print(sys.stdin.read().split(":")[1].strip())')"
+
+# --- 7. second daemon start fails (single-instance) ---
+echo "    second daemon start"
+second_start_exit=$("$workdir/relay" daemon start >/dev/null 2>&1; echo $?)
+check "second daemon start fails" "false" "$([ "$second_start_exit" = "0" ] && echo true || echo false)"
+
+# --- 8. unregistered tool reports TOOL_NOT_FOUND ---
+echo "    unregistered tool"
+cat > "$workdir/ghost.yaml" <<MANIFEST
+apiVersion: relay/v1
+kind: Tool
+metadata:
+  name: ghost
+  version: 0.0.1
+  description: unregistered test tool
+runtime:
+  name: relay
+  apiVersion: v1
+protocol:
+  type: rest
+  baseUrl: https://example.com
+tools:
+  - name: do_nothing
+    description: Does nothing
+    input:
+      type: object
+      properties: {}
+    request:
+      method: GET
+      path: /
+MANIFEST
+"$workdir/relay" build "$workdir/ghost.yaml" --out "$workdir/ghost" >/dev/null 2>&1
+check "unregistered tool gets TOOL_NOT_FOUND" "TOOL_NOT_FOUND" \
+    "$("$workdir/ghost" do-nothing 2>&1 >/dev/null | python3 -c 'import sys; print(sys.stdin.read().split(":")[1].strip())')"
+
+# --- 9. after stop: tool reports NETWORK_ERROR, status fails ---
+echo "    daemon stop"
+"$workdir/relay" daemon stop >/dev/null 2>&1
+sleep 1
+check "tool after stop gets NETWORK_ERROR" "NETWORK_ERROR" \
+    "$("$RELAY_HOME/tools/github" get-repository --owner openai --repo relay 2>&1 >/dev/null | python3 -c 'import sys; print(sys.stdin.read().split(":")[1].strip())')"
+check "status after stop fails" "false" "$("$workdir/relay" daemon status >/dev/null 2>&1 && echo true || echo false)"
+
+# --- 10. re-install is idempotent ---
+echo "    re-install idempotency"
+"$workdir/relay" daemon start >/dev/null 2>&1
+sleep 1
+pre_content=$(cat "$RELAY_HOME/registry/github.json")
+reinstall_exit=$("$workdir/relay" install "$tool" >/dev/null 2>&1; echo $?)
+post_content=$(cat "$RELAY_HOME/registry/github.json")
+check "re-install exits 0" "0" "$reinstall_exit"
+check "registry unchanged" "ok" "$([ "$pre_content" = "$post_content" ] && echo ok || echo bad)"
+
 echo
 echo "passed: $passed   failed: $failed"
 [ "$failed" -eq 0 ]

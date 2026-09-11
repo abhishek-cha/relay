@@ -6,12 +6,23 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
+	"syscall"
+	"time"
 
 	"relay/internal/build"
+	"relay/internal/ipc"
+	"relay/internal/paths"
+	"relay/internal/registry"
+	"relay/pkg/relay"
 )
 
 // version is overridable at build time:
@@ -19,7 +30,8 @@ import (
 //	go build -ldflags "-X main.version=1.0.0" ./cmd/relay
 var version = "0.0.0-dev"
 
-const usage = `relay — the local capability runtime for AI agents
+const usage = `
+relay — the local capability runtime for AI agents
 
 Usage:
   relay <command> [arguments]
@@ -29,13 +41,14 @@ Commands:
   install   Install and register a tool binary
   list      List registered tools
   inspect   Show a registered tool's descriptor
-  daemon    Manage the Relay daemon (start|stop|status|install)
+  daemon    Manage the Relay daemon (start|stop|restart|status|install)
   logs      Show daemon logs
   mcp       Run the MCP server
   auth      Manage tool credentials
   version   Print the Relay version
 
 The manifest and CLI contracts are the product; see docs/DESIGN.md.
+
 `
 
 func main() {
@@ -57,8 +70,17 @@ func run(args []string) int {
 		return 0
 	case "build":
 		return runBuild(args[1:])
+	case "install":
+		return runInstall(args[1:])
+	case "list":
+		return runList(args[1:])
+	case "inspect":
+		return runInspect(args[1:])
+	case "daemon":
+		return runDaemon(args[1:])
+	case "logs":
+		return runLogs(args[1:])
 	default:
-		// Remaining subcommands land with later TASKS.md milestones.
 		fmt.Fprintf(os.Stderr, "relay: %q is not implemented yet — see TASKS.md\n", args[0])
 		return 2
 	}
@@ -78,9 +100,6 @@ func runBuild(args []string) int {
 	sourceRoot := flags.String("source", "", "Relay source tree (default: discovered)")
 	keepWork := flags.Bool("keep", false, "keep the generated build directory")
 
-	// The Go flag package stops at the first positional argument, but
-	// "relay build manifest.yaml --skill SKILL.md" reads far better than
-	// forcing every flag ahead of the manifest.
 	if err := flags.Parse(permute(flags, args)); err != nil {
 		return 2
 	}
@@ -102,14 +121,12 @@ func runBuild(args []string) int {
 		return 1
 	}
 
-	// stdout carries the artifact path so scripts can capture it.
 	fmt.Println(result.OutPath)
 	fmt.Fprintf(os.Stderr, "relay: built %s %s\n", result.Name, result.Version)
 	return 0
 }
 
-// permute reorders arguments so flags precede positionals, preserving each
-// flag's value. A lone "--" ends flag parsing.
+// permute reorders arguments so flags precede positionals.
 func permute(flags *flag.FlagSet, args []string) []string {
 	var flagArgs, positional []string
 	for i := 0; i < len(args); i++ {
@@ -122,11 +139,11 @@ func permute(flags *flag.FlagSet, args []string) []string {
 			flagArgs = append(flagArgs, arg)
 			name := strings.TrimLeft(arg, "-")
 			if strings.Contains(name, "=") {
-				continue // value supplied inline
+				continue
 			}
 			flag := flags.Lookup(name)
 			if flag == nil {
-				continue // unknown flag: let Parse report it
+				continue
 			}
 			if boolean, ok := flag.Value.(interface{ IsBoolFlag() bool }); ok && boolean.IsBoolFlag() {
 				continue
@@ -140,4 +157,571 @@ func permute(flags *flag.FlagSet, args []string) []string {
 		positional = append(positional, arg)
 	}
 	return append(flagArgs, positional...)
+}
+
+// ─── install ────────────────────────────────────────────────────────────────
+
+// runInstall registers a tool binary with the running daemon (spec §15).
+func runInstall(args []string) int {
+	flags := flag.NewFlagSet("relay install", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	flags.Usage = func() {
+		fmt.Fprint(os.Stderr, "usage: relay install <path>\n")
+		flags.PrintDefaults()
+	}
+	if err := flags.Parse(permute(flags, args)); err != nil {
+		return 2
+	}
+	if flags.NArg() != 1 {
+		flags.Usage()
+		return 2
+	}
+
+	path := flags.Arg(0)
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "relay: cannot resolve path %q: %v\n", path, err)
+		return 1
+	}
+
+	layout := paths.Default()
+	socket := layout.Socket()
+	req := relay.RegisterRequest{Type: relay.FrameRegister, Path: absPath}
+	var resp relay.MutationResponse
+	if err := ipc.Call(context.Background(), socket, &req, &resp); err != nil {
+		if errors.Is(err, ipc.ErrUnavailable) {
+			fmt.Fprintf(os.Stderr, "relay: daemon is not running; start it with 'relay daemon start'\n")
+		} else {
+			fmt.Fprintf(os.Stderr, "relay: %v\n", err)
+		}
+		return 1
+	}
+
+	if !resp.Success {
+		if resp.Error != nil {
+			fmt.Fprintf(os.Stderr, "relay: %s: %s\n", resp.Error.Code, resp.Error.Message)
+		} else {
+			fmt.Fprintf(os.Stderr, "relay: install failed\n")
+		}
+		return 1
+	}
+
+	fmt.Printf("installed %s (%s)\n", resp.Tool, absPath)
+	return 0
+}
+
+// ─── list ───────────────────────────────────────────────────────────────────
+
+// runList prints the registered tools (spec §16).
+func runList(args []string) int {
+	flags := flag.NewFlagSet("relay list", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	flags.Usage = func() {
+		fmt.Fprint(os.Stderr, "usage: relay list\n")
+		flags.PrintDefaults()
+	}
+	if err := flags.Parse(permute(flags, args)); err != nil {
+		return 2
+	}
+	if flags.NArg() != 0 {
+		flags.Usage()
+		return 2
+	}
+
+	layout := paths.Default()
+	socket := layout.Socket()
+	req := relay.ListRequest{Type: relay.FrameList}
+	var resp relay.ListResponse
+	if err := ipc.Call(context.Background(), socket, &req, &resp); err != nil {
+		if errors.Is(err, ipc.ErrUnavailable) {
+			fmt.Fprintf(os.Stderr, "relay: daemon is not running; reading on-disk registry\n")
+			return runListFromDisk(layout)
+		}
+		fmt.Fprintf(os.Stderr, "relay: %v\n", err)
+		return 1
+	}
+
+	if !resp.Success {
+		if resp.Error != nil {
+			fmt.Fprintf(os.Stderr, "relay: %s: %s\n", resp.Error.Code, resp.Error.Message)
+		}
+		return 1
+	}
+
+	printToolTable(resp.Tools)
+	return 0
+}
+
+// runListFromDisk reads the registry directly when the daemon is not running.
+func runListFromDisk(layout paths.Layout) int {
+	store := registry.New(layout.Registry)
+	installations, err := store.List()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "relay: %v\n", err)
+		return 1
+	}
+	printToolTable(installations)
+	return 0
+}
+
+// printToolTable prints a compact aligned table of tools to stdout.
+func printToolTable(tools []relay.Installation) {
+	if len(tools) == 0 {
+		fmt.Println("no tools registered")
+		return
+	}
+
+	nameW, versionW, protoW, opsW := 4, 7, 8, 10
+	for _, t := range tools {
+		if len(t.Name) > nameW {
+			nameW = len(t.Name)
+		}
+		if len(t.Version) > versionW {
+			versionW = len(t.Version)
+		}
+		if len(t.Protocol) > protoW {
+			protoW = len(t.Protocol)
+		}
+		ops := strings.Join(t.Operations, ",")
+		if len(ops) > opsW {
+			opsW = len(ops)
+		}
+	}
+
+	fmt.Printf("%-*s  %-*s  %-*s  %-*s\n", nameW, "NAME", versionW, "VERSION", protoW, "PROTOCOL", opsW, "OPERATIONS")
+	for _, t := range tools {
+		ops := strings.Join(t.Operations, ",")
+		fmt.Printf("%-*s  %-*s  %-*s  %-*s\n", nameW, t.Name, versionW, t.Version, protoW, t.Protocol, opsW, ops)
+	}
+}
+
+// ─── inspect ────────────────────────────────────────────────────────────────
+
+// runInspect prints a tool's descriptor as indented JSON (spec §9).
+func runInspect(args []string) int {
+	flags := flag.NewFlagSet("relay inspect", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	flags.Usage = func() {
+		fmt.Fprint(os.Stderr, "usage: relay inspect <tool>\n")
+		flags.PrintDefaults()
+	}
+	if err := flags.Parse(permute(flags, args)); err != nil {
+		return 2
+	}
+	if flags.NArg() != 1 {
+		flags.Usage()
+		return 2
+	}
+
+	tool := flags.Arg(0)
+	layout := paths.Default()
+	socket := layout.Socket()
+	req := relay.InspectRequest{Type: relay.FrameInspect, Tool: tool}
+	var resp relay.InspectResponse
+	if err := ipc.Call(context.Background(), socket, &req, &resp); err != nil {
+		if errors.Is(err, ipc.ErrUnavailable) {
+			fmt.Fprintf(os.Stderr, "relay: daemon is not running; start it with 'relay daemon start'\n")
+		} else {
+			fmt.Fprintf(os.Stderr, "relay: %v\n", err)
+		}
+		return 1
+	}
+
+	if !resp.Success {
+		if resp.Error != nil {
+			fmt.Fprintf(os.Stderr, "relay: %s: %s\n", resp.Error.Code, resp.Error.Message)
+		} else {
+			fmt.Fprintf(os.Stderr, "relay: inspect failed\n")
+		}
+		return 1
+	}
+
+	if resp.Descriptor != nil {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(resp.Descriptor); err != nil {
+			fmt.Fprintf(os.Stderr, "relay: encode descriptor: %v\n", err)
+			return 1
+		}
+	}
+
+	if resp.Install != nil {
+		fmt.Fprintf(os.Stderr, "relay: installed at %s\n", resp.Install.Path)
+		fmt.Fprintf(os.Stderr, "relay: version %s, protocol %s\n", resp.Install.Version, resp.Install.Protocol)
+	}
+
+	return 0
+}
+
+// ─── daemon ─────────────────────────────────────────────────────────────────
+
+// runDaemon dispatches daemon subcommands (spec §3.3).
+func runDaemon(args []string) int {
+	if len(args) == 0 {
+		fmt.Fprint(os.Stderr, "usage: relay daemon <start|stop|restart|status|install>\n")
+		return 2
+	}
+
+	switch args[0] {
+	case "start":
+		return daemonStart()
+	case "stop":
+		return daemonStop()
+	case "restart":
+		return daemonRestart()
+	case "status":
+		return daemonStatus()
+	case "install":
+		return daemonInstall()
+	default:
+		fmt.Fprintf(os.Stderr, "relay: unknown daemon subcommand %q\n", args[0])
+		return 2
+	}
+}
+
+// daemonStart starts the relayd daemon detached (spec §3.3).
+//
+// If a daemon already owns this Relay home the newly spawned relayd will
+// refuse to start (exit 1, "another Relay daemon already owns ..."). We
+// detect this by checking the process exit status during the readiness poll:
+// if the process has exited before the socket came up the start failed.
+func daemonStart() int {
+	layout := paths.Default()
+
+	// Check whether the socket is already live before we do anything.
+	if conn, err := net.DialTimeout("unix", layout.Socket(), 250*time.Millisecond); err == nil {
+		conn.Close()
+		fmt.Fprintf(os.Stderr, "relay: a daemon is already running on %s\n", layout.Socket())
+		return 1
+	}
+
+	relaydPath, err := findRelayd()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "relay: %v\n", err)
+		return 1
+	}
+
+	logPath := layout.LogFile()
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "relay: create log directory: %v\n", err)
+		return 1
+	}
+
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "relay: open log %s: %v\n", logPath, err)
+		return 1
+	}
+	defer logFile.Close()
+
+	cmd := exec.Command(relaydPath)
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "relay: start daemon: %v\n", err)
+		return 1
+	}
+
+	pid := cmd.Process.Pid
+	fmt.Fprintf(os.Stderr, "relay: daemon starting (pid %d)\n", pid)
+
+	// Poll the socket for readiness, but also watch for the process exiting.
+	// relayd fails fast when another daemon holds the lock, so we must not
+	// conflate "socket is live" with "our relayd owns it".
+	socket := layout.Socket()
+	deadline := time.Now().Add(3 * time.Second)
+	var waitDone chan error
+	if cmd.ProcessState == nil {
+		waitDone = make(chan error, 1)
+		go func() { waitDone <- cmd.Wait() }()
+	}
+	for time.Now().Before(deadline) {
+		if waitDone != nil {
+			select {
+			case waitErr := <-waitDone:
+				// relayd exited before the socket appeared.
+				if waitErr != nil {
+					fmt.Fprintf(os.Stderr, "relay: daemon exited: %v\n", waitErr)
+				} else {
+					fmt.Fprintf(os.Stderr, "relay: daemon exited unexpectedly\n")
+				}
+				fmt.Fprintf(os.Stderr, "relay: last lines of %s:\n", logPath)
+				showLogTail(logPath, 20)
+				return 1
+			default:
+			}
+		}
+		conn, err := net.DialTimeout("unix", socket, 250*time.Millisecond)
+		if err == nil {
+			conn.Close()
+			fmt.Fprintf(os.Stderr, "relay: daemon started (pid %d)\n", pid)
+			return 0
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	fmt.Fprintf(os.Stderr, "relay: daemon failed to start within timeout; last lines of %s:\n", logPath)
+	showLogTail(logPath, 20)
+	return 1
+}
+
+// findRelayd locates the relayd binary next to os.Executable() or on PATH.
+func findRelayd() (string, error) {
+	exe, err := os.Executable()
+	if err == nil {
+		candidate := filepath.Join(filepath.Dir(exe), "relayd")
+		if info, err := os.Stat(candidate); err == nil && info.Mode().IsRegular() {
+			return candidate, nil
+		}
+	}
+
+	if path, err := exec.LookPath("relayd"); err == nil {
+		return path, nil
+	}
+
+	return "", fmt.Errorf("relayd binary not found; build it with 'go build ./cmd/relayd'")
+}
+
+// daemonStop stops the running daemon by sending SIGTERM (spec §3.9).
+func daemonStop() int {
+	layout := paths.Default()
+	socket := layout.Socket()
+
+	req := relay.StatusRequest{Type: relay.FrameStatus}
+	var resp relay.StatusResponse
+	if err := ipc.Call(context.Background(), socket, &req, &resp); err != nil {
+		fmt.Fprintf(os.Stderr, "relay: daemon is not running\n")
+		return 0
+	}
+
+	if !resp.Success {
+		fmt.Fprintf(os.Stderr, "relay: daemon is not running\n")
+		return 0
+	}
+
+	pid := resp.Server.Pid
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "relay: cannot find process %d: %v\n", pid, err)
+		return 1
+	}
+
+	if err := proc.Signal(syscall.SIGTERM); err != nil {
+		fmt.Fprintf(os.Stderr, "relay: send SIGTERM to %d: %v\n", pid, err)
+		return 1
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("unix", socket, 250*time.Millisecond)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "relay: daemon stopped\n")
+			return 0
+		}
+		conn.Close()
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	fmt.Fprintf(os.Stderr, "relay: daemon did not stop within timeout\n")
+	return 1
+}
+
+// daemonRestart stops then starts the daemon.
+func daemonRestart() int {
+	daemonStop()
+	return daemonStart()
+}
+
+// daemonStatus prints daemon health information as JSON on stdout (spec §3.3).
+//
+// The StatusResponse is emitted as-is so scripts can parse it. Human-readable
+// statusOutput is the flattened JSON shape for "relay daemon status" stdout.
+// It promotes fields from ServerInfo so scripts can read d["pid"] and
+// d["version"] without digging into d["server"] (spec §3.3).
+type statusOutput struct {
+	Success       bool    `json:"success"`
+	Version       string  `json:"version"`
+	Pid           int     `json:"pid"`
+	Socket        string  `json:"socket"`
+	StartedAt     string  `json:"startedAt"`
+	RuntimeName   string  `json:"runtimeName"`
+	RuntimeAPI    string  `json:"runtimeApiVersion"`
+	Tools         int     `json:"tools"`
+	UptimeSeconds float64 `json:"uptimeSeconds"`
+}
+
+// daemonStatus prints daemon health information as JSON on stdout (spec §3.3).
+//
+// Human-readable diagnostics go to stderr.
+func daemonStatus() int {
+	layout := paths.Default()
+	socket := layout.Socket()
+	req := relay.StatusRequest{Type: relay.FrameStatus}
+	var resp relay.StatusResponse
+	if err := ipc.Call(context.Background(), socket, &req, &resp); err != nil {
+		if errors.Is(err, ipc.ErrUnavailable) {
+			fmt.Fprintf(os.Stderr, "relay: daemon is not running\n")
+		} else {
+			fmt.Fprintf(os.Stderr, "relay: %v\n", err)
+		}
+		return 1
+	}
+
+	if !resp.Success {
+		if resp.Error != nil {
+			fmt.Fprintf(os.Stderr, "relay: %s: %s\n", resp.Error.Code, resp.Error.Message)
+		} else {
+			fmt.Fprintf(os.Stderr, "relay: daemon status failed\n")
+		}
+		return 1
+	}
+
+	// Flatten so scripts can read d["pid"], d["version"], etc.
+	out := statusOutput{
+		Success:       resp.Success,
+		Version:       resp.Server.Version,
+		Pid:           resp.Server.Pid,
+		Socket:        resp.Server.Socket,
+		StartedAt:     resp.Server.StartedAt.Format(time.RFC3339),
+		RuntimeName:   resp.Runtime.Name,
+		RuntimeAPI:    resp.Runtime.APIVersion,
+		Tools:         resp.Tools,
+		UptimeSeconds: resp.UptimeSeconds,
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(&out); err != nil {
+		fmt.Fprintf(os.Stderr, "relay: encode status: %v\n", err)
+		return 1
+	}
+
+	// stderr carries a human summary.
+	duration := time.Duration(resp.UptimeSeconds * float64(time.Second)).Round(time.Second)
+	fmt.Fprintf(os.Stderr, "relay: daemon running (pid %d, uptime %s, %d tools)\n", resp.Server.Pid, duration, resp.Tools)
+	return 0
+}
+
+// daemonInstall writes a macOS LaunchAgent plist for the daemon.
+func daemonInstall() int {
+	layout := paths.Default()
+
+	relaydPath, err := findRelayd()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "relay: %v\n", err)
+		return 1
+	}
+
+	absRelayd, err := filepath.Abs(relaydPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "relay: resolve relayd path: %v\n", err)
+		return 1
+	}
+
+	launchAgentsDir := filepath.Join(os.Getenv("HOME"), "Library", "LaunchAgents")
+	if err := os.MkdirAll(launchAgentsDir, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "relay: create LaunchAgents directory: %v\n", err)
+		return 1
+	}
+
+	plistPath := filepath.Join(launchAgentsDir, "com.relay.daemon.plist")
+	logPath := layout.LogFile()
+	socketPath := layout.Socket()
+
+	plist := buildPlist(absRelayd, socketPath, logPath, layout.Root)
+
+	if err := os.WriteFile(plistPath, []byte(plist), 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "relay: write plist: %v\n", err)
+		return 1
+	}
+
+	fmt.Fprintf(os.Stderr, "relay: wrote %s\n", plistPath)
+	fmt.Fprintf(os.Stderr, "relay: load the daemon with:\n")
+	fmt.Fprintf(os.Stderr, "  launchctl load %s\n", plistPath)
+	return 0
+}
+
+// buildPlist generates the LaunchAgent plist XML.
+func buildPlist(relayd, socket, log, home string) string {
+	var b strings.Builder
+	b.WriteString("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")
+	b.WriteString("<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n")
+	b.WriteString("<plist version=\"1.0\">\n")
+	b.WriteString("<dict>\n")
+	b.WriteString("\t<key>Label</key>\n")
+	b.WriteString("\t<string>com.relay.daemon</string>\n")
+	b.WriteString("\t<key>ProgramArguments</key>\n")
+	b.WriteString("\t<array>\n")
+	b.WriteString(fmt.Sprintf("\t\t<string>%s</string>\n", relayd))
+	b.WriteString("\t\t<string>--socket</string>\n")
+	b.WriteString(fmt.Sprintf("\t\t<string>%s</string>\n", socket))
+	b.WriteString("\t</array>\n")
+	b.WriteString("\t<key>RunAtLoad</key>\n")
+	b.WriteString("\t<true/>\n")
+	b.WriteString("\t<key>KeepAlive</key>\n")
+	b.WriteString("\t<true/>\n")
+	b.WriteString("\t<key>StandardOutPath</key>\n")
+	b.WriteString(fmt.Sprintf("\t<string>%s</string>\n", log))
+	b.WriteString("\t<key>StandardErrorPath</key>\n")
+	b.WriteString(fmt.Sprintf("\t<string>%s</string>\n", log))
+	b.WriteString("\t<key>EnvironmentVariables</key>\n")
+	b.WriteString("\t<dict>\n")
+	b.WriteString("\t\t<key>RELAY_HOME</key>\n")
+	b.WriteString(fmt.Sprintf("\t\t<string>%s</string>\n", home))
+	b.WriteString("\t</dict>\n")
+	b.WriteString("</dict>\n")
+	b.WriteString("</plist>\n")
+	return b.String()
+}
+
+// ─── logs ───────────────────────────────────────────────────────────────────
+
+// runLogs prints daemon log lines (spec §3.3).
+func runLogs(args []string) int {
+	flags := flag.NewFlagSet("relay logs", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	flags.Usage = func() {
+		fmt.Fprint(os.Stderr, "usage: relay logs [-n LINES]\n")
+		flags.PrintDefaults()
+	}
+	n := flags.Int("n", 50, "number of lines to show")
+	if err := flags.Parse(permute(flags, args)); err != nil {
+		return 2
+	}
+	if flags.NArg() != 0 {
+		flags.Usage()
+		return 2
+	}
+
+	layout := paths.Default()
+	logPath := layout.LogFile()
+
+	fmt.Fprintf(os.Stderr, "relay: %s\n", logPath)
+
+	if err := showLogTail(logPath, *n); err != nil {
+		fmt.Fprintf(os.Stderr, "relay: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+// showLogTail prints the last n lines of a log file to stdout.
+func showLogTail(path string, n int) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+
+	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	start := len(lines) - n
+	if start < 0 {
+		start = 0
+	}
+	for _, line := range lines[start:] {
+		fmt.Println(line)
+	}
+	return nil
 }
