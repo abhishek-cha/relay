@@ -12,8 +12,9 @@ import (
 )
 
 // Validate checks that a skill is present and usable. It is deliberately
-// shallow for the MVP: deeper linting (rejecting skills that restate the
-// manifest's schema) lands with TASKS.md milestone M5.
+// shallow. Rejecting a skill that restates the manifest's schema takes the
+// manifest as context, so it lives in Lint instead; the build calls Lint with
+// the parsed document (spec §30).
 func Validate(data []byte) error {
 	text := strings.TrimSpace(string(data))
 	if text == "" {
