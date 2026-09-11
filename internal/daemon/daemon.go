@@ -43,6 +43,12 @@ type Config struct {
 	Telemetry UsageRecorder
 	// ToolTimeout bounds a tool's discovery reply. Defaults to 10s.
 	ToolTimeout time.Duration
+	// DestructiveOps names the operations that require explicit confirmation
+	// before they run (spec §25). It is daemon configuration because the manifest
+	// schema has no field for destructiveness, so a tool cannot widen its own
+	// confirmation surface by editing its manifest. Empty means no operation is
+	// gated, which is the default: behavior is unchanged until this is set.
+	DestructiveOps []string
 	// Now is the clock, injectable so uptime and install timestamps are testable.
 	Now func() time.Time
 	// Socket overrides the socket path. Empty means the layout's default, which
@@ -54,17 +60,18 @@ type Config struct {
 
 // Daemon serves Relay operations over IPC.
 type Daemon struct {
-	layout      paths.Layout
-	version     string
-	store       *registry.Store
-	resolver    *auth.Resolver
-	usage       UsageRecorder
-	executors   map[string]protocol.Executor
-	toolTimeout time.Duration
-	now         func() time.Time
-	started     time.Time
-	socket      string
-	logw        io.Writer
+	layout         paths.Layout
+	version        string
+	store          *registry.Store
+	resolver       *auth.Resolver
+	usage          UsageRecorder
+	executors      map[string]protocol.Executor
+	toolTimeout    time.Duration
+	destructiveOps []string
+	now            func() time.Time
+	started        time.Time
+	socket         string
+	logw           io.Writer
 }
 
 // New builds a daemon. The daemon owns its Relay home: it is the only writer of
@@ -96,17 +103,18 @@ func New(cfg Config) *Daemon {
 		keychainStore = &keychain.SecurityStore{}
 	}
 	return &Daemon{
-		layout:      cfg.Layout,
-		version:     cfg.Version,
-		store:       registry.New(cfg.Layout.Registry),
-		resolver:    auth.New(keychainStore),
-		usage:       cfg.Telemetry,
-		executors:   executors,
-		toolTimeout: timeout,
-		now:         now,
-		started:     now(),
-		socket:      socket,
-		logw:        logw,
+		layout:         cfg.Layout,
+		version:        cfg.Version,
+		store:          registry.New(cfg.Layout.Registry),
+		resolver:       auth.New(keychainStore),
+		usage:          cfg.Telemetry,
+		executors:      executors,
+		toolTimeout:    timeout,
+		destructiveOps: append([]string(nil), cfg.DestructiveOps...),
+		now:            now,
+		started:        now(),
+		socket:         socket,
+		logw:           logw,
 	}
 }
 
@@ -231,8 +239,9 @@ func (d *Daemon) hello(request relay.HelloRequest) relay.HelloResponse {
 //
 // The order matters: the tool must be registered, its manifest must be readable
 // and compatible, the operation must exist, and the input must validate before
-// any network traffic happens. That way a caller gets a precise error instead of
-// a confusing remote failure (spec §18, §26).
+// any network traffic happens. The permission boundary then runs before the
+// credential is read and before protocol dispatch (spec §18). That way a caller
+// gets a precise error instead of a confusing remote failure (spec §18, §26).
 func (d *Daemon) invokeOperation(ctx context.Context, request relay.InvokeRequest) relay.InvokeResponse {
 	installation, err := d.store.Get(request.Tool)
 	if err != nil {
@@ -255,6 +264,15 @@ func (d *Daemon) invokeOperation(ctx context.Context, request relay.InvokeReques
 	}
 
 	if failure := operation.ValidateInput(request.Input); failure != nil {
+		return invokeFailure(failure)
+	}
+
+	// The permission boundary runs before any credential is read and before a
+	// protocol executor is handed the call (spec §18, §40): an operation the
+	// manifest is not entitled to run is refused here, so no secret leaves the
+	// Keychain and no request leaves the daemon on its behalf. This sits inside
+	// the timed invoke, so a denied call is still recorded as usage (spec §31).
+	if failure := d.permissionCheck(doc, operation.Name); failure != nil {
 		return invokeFailure(failure)
 	}
 
@@ -394,6 +412,9 @@ func specFor(doc *manifest.Document, operation *manifest.Tool) protocol.Spec {
 		Query:    operation.Request.Query,
 		Headers:  operation.Request.Headers,
 		Body:     operation.Request.Body,
+
+		Document:  operation.Request.Document,
+		Variables: operation.Request.Variables,
 	}
 }
 
