@@ -49,6 +49,18 @@ func TestValidateAcceptsValidManifest(t *testing.T) {
 	}
 }
 
+// A protocol the local runtime cannot execute is still a valid manifest: the
+// schema layer checks vocabulary, and the daemon is what rejects an operation
+// it has no executor for (spec §19, §35). GraphQL is declared in relay/v1
+// before any GraphQL executor exists, so it must pass validation.
+func TestValidateAcceptsKnownProtocolWithoutExecutor(t *testing.T) {
+	doc := mustParse(t, validManifest)
+	doc.Protocol.Type = "graphql"
+	doc.Protocol.BaseURL = ""
+	if err := doc.Validate(); err != nil {
+		t.Fatalf("a known but unimplemented protocol must validate, got: %v", err)
+	}
+}
 func TestValidateRejects(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -79,11 +91,6 @@ func TestValidateRejects(t *testing.T) {
 			name:    "unknown protocol",
 			mutate:  func(d *Document) { d.Protocol.Type = "smoke-signals" },
 			wantErr: "unknown protocol",
-		},
-		{
-			name:    "unimplemented protocol",
-			mutate:  func(d *Document) { d.Protocol.Type = "graphql" },
-			wantErr: "not implemented yet",
 		},
 		{
 			name:    "rest without baseUrl",

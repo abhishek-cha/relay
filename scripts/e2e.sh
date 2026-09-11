@@ -108,7 +108,18 @@ go build -o "$workdir/relay" ./cmd/relay
 # torn down even on early exit.
 RELAY_HOME="$(mktemp -d)"
 export RELAY_HOME
-trap '"$workdir/relay" daemon stop >/dev/null 2>&1 || true; rm -rf "$RELAY_HOME"' EXIT
+
+# server_pid is set by the offline REST round-trip below.  The trap kills it, so
+# the loopback server never outlives the run even on an early exit.
+server_pid=""
+cleanup() {
+    if [ -n "${server_pid:-}" ]; then
+        kill "$server_pid" >/dev/null 2>&1 || true
+    fi
+    "$workdir/relay" daemon stop >/dev/null 2>&1 || true
+    rm -rf "$RELAY_HOME"
+}
+trap cleanup EXIT
 
 # Prepend the workdir so relay can find its sibling relayd.
 PATH="$workdir:$PATH"
@@ -153,10 +164,42 @@ ok = d.get("name") == "github" and "get_repository" in names and "list_pull_requ
 print("ok" if ok else "bad:name=" + str(d.get("name")) + " tools=" + str(names))
 ' 2>&1)"
 
-# --- 6. registered tool routes through daemon, gets PROTOCOL_ERROR ---
+# --- 6. registered tool routes through daemon; a protocol with no executor is
+# rejected with PROTOCOL_ERROR ---
+#
+# The REST executor is wired into the daemon now, so invoking the example tool
+# would really leave the machine and hit api.github.com.  This asserts the
+# daemon's unimplemented-protocol rejection with a throwaway tool instead: a
+# declared protocol that has no executor yet is rejected rather than guessed at
+# (spec §19, §20).  The build/install shape mirrors the 'ghost' block in §8.
 echo "    registered tool invocation"
-check "registered tool gets PROTOCOL_ERROR" "PROTOCOL_ERROR" \
-    "$("$RELAY_HOME/tools/github" get-repository --owner openai --repo relay 2>&1 >/dev/null | python3 -c 'import sys; print(sys.stdin.read().split(":")[1].strip())')"
+cat > "$workdir/unimplemented.yaml" <<MANIFEST
+apiVersion: relay/v1
+kind: Tool
+metadata:
+  name: unimplemented
+  version: 0.0.1
+  description: throwaway tool declaring a protocol the daemon cannot execute
+runtime:
+  name: relay
+  apiVersion: v1
+protocol:
+  type: graphql
+  endpoint: https://example.invalid/graphql
+tools:
+  - name: ping
+    description: Never reaches an executor
+    input:
+      type: object
+      properties: {}
+    request:
+      method: POST
+      path: /
+MANIFEST
+"$workdir/relay" build "$workdir/unimplemented.yaml" --out "$workdir/unimplemented" >/dev/null 2>&1
+"$workdir/relay" install "$workdir/unimplemented" >/dev/null 2>&1
+check "unimplemented protocol gets PROTOCOL_ERROR" "PROTOCOL_ERROR" \
+    "$("$RELAY_HOME/tools/unimplemented" ping 2>&1 >/dev/null | python3 -c 'import sys; print(sys.stdin.read().split(":")[1].strip())')"
 
 # --- 7. second daemon start fails (single-instance) ---
 echo "    second daemon start"
@@ -192,7 +235,122 @@ MANIFEST
 check "unregistered tool gets TOOL_NOT_FOUND" "TOOL_NOT_FOUND" \
     "$("$workdir/ghost" do-nothing 2>&1 >/dev/null | python3 -c 'import sys; print(sys.stdin.read().split(":")[1].strip())')"
 
-# --- 9. after stop: tool reports NETWORK_ERROR, status fails ---
+# --- 9. offline REST round-trip through the daemon ---
+# Exercises the full path -- installed tool -> daemon -> REST executor -> a
+# loopback server -- with nothing leaving the machine.  The server records each
+# request line and serves a fixed JSON body; this is what proves the REST
+# executor actually works end to end.
+echo "    offline REST round-trip"
+reqlog="$workdir/rest.requests"
+: > "$reqlog"
+cat > "$workdir/rest_server.py" <<'PY'
+import json, os
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+BODY = json.dumps({"message": "hello from the relay e2e server", "ok": True}).encode()
+
+
+class Handler(BaseHTTPRequestHandler):
+    # Silence the default per-request stderr logging; the request log written
+    # below is the only record this test wants.
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        with open(os.environ["RELAY_E2E_REQLOG"], "a") as f:
+            f.write("GET %s\n" % self.path)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(BODY)))
+        self.end_headers()
+        self.wfile.write(BODY)
+
+
+server = HTTPServer(("127.0.0.1", 0), Handler)
+with open(os.environ["RELAY_E2E_PORTFILE"], "w") as f:
+    f.write(str(server.server_address[1]))
+server.serve_forever()
+PY
+RELAY_E2E_REQLOG="$reqlog" RELAY_E2E_PORTFILE="$workdir/rest.port" \
+    python3 "$workdir/rest_server.py" &
+server_pid=$!
+# Detach from the job table so the trap's kill does not print a job-control
+# notice; the PID is tracked explicitly above.
+disown "$server_pid" 2>/dev/null || true
+# Wait for the server to report the ephemeral port it bound.
+for _ in $(seq 1 50); do
+    [ -s "$workdir/rest.port" ] && break
+    sleep 0.1
+done
+port="$(cat "$workdir/rest.port" 2>/dev/null)"
+check "loopback server is listening" "yes" "$([ -n "$port" ] && echo yes || echo no)"
+
+cat > "$workdir/demo.yaml" <<MANIFEST
+apiVersion: relay/v1
+kind: Tool
+metadata:
+  name: demo
+  version: 0.0.1
+  description: offline REST round-trip test tool
+runtime:
+  name: relay
+  apiVersion: v1
+protocol:
+  type: rest
+  baseUrl: http://127.0.0.1:$port
+tools:
+  - name: get_repo
+    description: Get a single repository
+    input:
+      type: object
+      properties:
+        owner:
+          type: string
+        repo:
+          type: string
+      required:
+        - owner
+        - repo
+    request:
+      method: GET
+      path: /repos/{owner}/{repo}
+  - name: list_repos
+    description: List an owner's repositories
+    input:
+      type: object
+      properties:
+        owner:
+          type: string
+        state:
+          type: string
+      required:
+        - owner
+    request:
+      method: GET
+      path: /repos/{owner}/repos
+      query:
+        state: "{state}"
+MANIFEST
+"$workdir/relay" build "$workdir/demo.yaml" --out "$workdir/demo" >/dev/null 2>&1
+check "demo tool installs" "0" "$("$workdir/relay" install "$workdir/demo" >/dev/null 2>&1; echo $?)"
+
+# Invoke the INSTALLED binary so the whole path runs.
+demo="$RELAY_HOME/tools/demo"
+get_out="$("$demo" get-repo --owner openai --repo relay 2>"$workdir/demo.err")"
+check "get_repo exits 0" "0" "$?"
+check "get_repo stdout equals the served JSON" "ok" \
+    "$(printf '%s' "$get_out" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("ok" if d == {"message": "hello from the relay e2e server", "ok": True} else "bad:" + repr(d))' 2>&1)"
+check "get_repo request line" "GET /repos/openai/relay" "$(tail -n 1 "$reqlog")"
+
+"$demo" list-repos --owner openai --state open >/dev/null 2>&1
+check "list_repos (with state) exits 0" "0" "$?"
+check "list_repos sends the declared query param" "GET /repos/openai/repos?state=open" "$(tail -n 1 "$reqlog")"
+
+"$demo" list-repos --owner openai >/dev/null 2>&1
+check "list_repos (without state) exits 0" "0" "$?"
+check "list_repos omits an unsupplied query param" "GET /repos/openai/repos" "$(tail -n 1 "$reqlog")"
+
+# --- 10. after stop: tool reports NETWORK_ERROR, status fails ---
 echo "    daemon stop"
 "$workdir/relay" daemon stop >/dev/null 2>&1
 sleep 1
@@ -200,7 +358,7 @@ check "tool after stop gets NETWORK_ERROR" "NETWORK_ERROR" \
     "$("$RELAY_HOME/tools/github" get-repository --owner openai --repo relay 2>&1 >/dev/null | python3 -c 'import sys; print(sys.stdin.read().split(":")[1].strip())')"
 check "status after stop fails" "false" "$("$workdir/relay" daemon status >/dev/null 2>&1 && echo true || echo false)"
 
-# --- 10. re-install is idempotent ---
+# --- 11. re-install is idempotent ---
 echo "    re-install idempotency"
 "$workdir/relay" daemon start >/dev/null 2>&1
 sleep 1

@@ -10,14 +10,19 @@ import (
 // Validation rules from spec §59: required fields, schema correctness,
 // duplicate operation names, invalid protocol, invalid auth.
 
+// knownProtocols is the relay/v1 vocabulary a manifest may declare. It is
+// deliberately NOT the set this build can execute: whether an executor exists
+// is a runtime question, answered by the daemon's executor map, which rejects
+// an unimplemented protocol with PROTOCOL_ERROR (spec §19). Failing the build
+// here instead would make that runtime path unreachable and would break a tool
+// built for a newer runtime than the local daemon (spec §34, §35).
 var (
-	toolNamePattern    = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
-	pathParamPattern   = regexp.MustCompile(`\{([a-zA-Z_][a-zA-Z0-9_]*)\}`)
-	knownProtocols     = map[string]bool{"rest": true, "graphql": true, "grpc": true, "browser": true, "local": true}
-	supportedProtocols = map[string]bool{"rest": true}
-	knownAuthTypes     = map[string]bool{"api_key": true, "bearer": true, "basic": true, "oauth2": true, "client_credentials": true}
-	knownCapabilities  = map[string]bool{"network": true, "keychain": true, "browser": true, "filesystem.read": true, "filesystem.write": true, "shell": true, "notifications": true, "clipboard": true}
-	allowedMethods     = map[string]bool{"GET": true, "POST": true, "PUT": true, "PATCH": true, "DELETE": true}
+	toolNamePattern   = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
+	pathParamPattern  = regexp.MustCompile(`\{([a-zA-Z_][a-zA-Z0-9_]*)\}`)
+	knownProtocols    = map[string]bool{"rest": true, "graphql": true, "grpc": true, "browser": true, "local": true}
+	knownAuthTypes    = map[string]bool{"api_key": true, "bearer": true, "basic": true, "oauth2": true, "client_credentials": true}
+	knownCapabilities = map[string]bool{"network": true, "keychain": true, "browser": true, "filesystem.read": true, "filesystem.write": true, "shell": true, "notifications": true, "clipboard": true}
+	allowedMethods    = map[string]bool{"GET": true, "POST": true, "PUT": true, "PATCH": true, "DELETE": true}
 )
 
 // ValidationError aggregates every problem found, so one build reports the
@@ -58,8 +63,6 @@ func (d *Document) Validate() error {
 		add("protocol.type: required")
 	} else if !knownProtocols[d.Protocol.Type] {
 		add("protocol.type: unknown protocol %q", d.Protocol.Type)
-	} else if !supportedProtocols[d.Protocol.Type] {
-		add("protocol.type: %q is not implemented yet (REST only for the MVP)", d.Protocol.Type)
 	}
 	if d.Protocol.Type == "rest" && d.Protocol.BaseURL == "" {
 		add("protocol.baseUrl: required for rest")
