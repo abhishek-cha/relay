@@ -747,22 +747,28 @@ func TestRunFlagParseErrors(t *testing.T) {
 	}
 }
 
-// The runtime's local validation covers flag syntax and missing required inputs.
-// Values injected through --input/--input-json are forwarded as-is; the daemon
-// re-validates the whole object against the same schema (spec §40). This test
-// pins the current behaviour so a change to it is deliberate.
-func TestRunJSONInputValidationDeferredToDaemon(t *testing.T) {
+// The runtime validates the assembled input against the operation's schema
+// before it invokes anything, so a value that arrived through --input or
+// --input-json and does not fit the schema is rejected here rather than
+// travelling to the daemon and surfacing only from there. The daemon still
+// re-validates the whole object against the same schema, because the tool
+// binary is untrusted (spec §10, §40).
+func TestRunJSONInputIsValidatedLocally(t *testing.T) {
 	invoker := okInvoker()
 	app, stdout, stderr := newDemoApp(t, invoker)
 	got := runApp(t, app, stdout, stderr, "get-thing",
 		"--input-json", "{\"id\":1,\"bogus\":true,\"limit\":\"three\"}")
-	if got.code != ExitOK {
-		t.Fatalf("exit = %d, want %d (stderr: %s)", got.code, ExitOK, got.stderr)
+	if got.code != ExitError {
+		t.Fatalf("exit = %d, want %d (stderr: %s)", got.code, ExitError, got.stderr)
 	}
-	request := singleInvocation(t, invoker)
-	want := map[string]any{"id": float64(1), "bogus": true, "limit": "three"}
-	if !reflect.DeepEqual(request.Input, want) {
-		t.Fatalf("input = %#v, want %#v", request.Input, want)
+	if !strings.Contains(got.stderr, string(relay.CodeInvalidInput)) {
+		t.Fatalf("stderr = %q, want the %s code", got.stderr, relay.CodeInvalidInput)
+	}
+	if !strings.Contains(got.stderr, "unknown input") {
+		t.Fatalf("stderr = %q, want the unknown-property diagnostic", got.stderr)
+	}
+	if len(invoker.calls) != 0 {
+		t.Fatalf("input reached the invoker despite failing validation: %d call(s)", len(invoker.calls))
 	}
 }
 

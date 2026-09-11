@@ -3,6 +3,7 @@ package manifest
 import (
 	"fmt"
 	"math"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -89,11 +90,22 @@ func checkType(name string, property Property, value any) *relay.Error {
 			return describe("an object")
 		}
 	case "array":
-		if _, ok := value.([]any); !ok {
+		if !isSlice(value) {
 			return describe("an array")
 		}
 	}
 	return nil
+}
+
+// isSlice reports whether value is a slice, whatever its element type.
+//
+// An array reaches this package in one of two Go shapes: the daemon decodes
+// JSON into []any, while the tool runtime's flag layer builds typed slices
+// such as []string and []int64 (spec §11). Both are arrays, so the check is
+// structural instead of a match on the exact dynamic type.
+func isSlice(value any) bool {
+	kind := reflect.TypeOf(value)
+	return kind != nil && kind.Kind() == reflect.Slice
 }
 
 func checkEnum(name string, property Property, value any) *relay.Error {

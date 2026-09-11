@@ -277,11 +277,15 @@ func (a *App) parseInput(tool *manifest.Tool, args []string) (map[string]any, pa
 		}
 	})
 
-	for _, name := range tool.Input.Required {
-		if _, ok := input[name]; !ok {
-			return nil, parseOK, relay.NewError(relay.CodeInvalidInput,
-				fmt.Sprintf("missing required input %q", name))
-		}
+	// Validate the assembled input against the operation's schema before it
+	// leaves this process. The flag path already rejects unknown flags and
+	// mistyped values, but --input and --input-json bypass the flag parser, so
+	// without this step an unknown property or a wrong type would travel all
+	// the way to the daemon and only be reported from there (spec §10, §40).
+	// The daemon still validates again, because a tool binary is untrusted and
+	// the trusted component cannot assume its caller did the work.
+	if failure := tool.ValidateInput(input); failure != nil {
+		return nil, parseOK, failure
 	}
 
 	return input, parseOK, nil
