@@ -107,14 +107,27 @@ type Property struct {
 	Items       *Property `yaml:"items,omitempty" json:"items,omitempty"`
 }
 
-// Request describes how to reach the operation. The MVP models REST; GraphQL
-// and gRPC extend this in a later milestone (spec §20, §44, §45).
+// Request describes how to reach the operation. REST uses Method, Path, Query,
+// Headers, and Body; GraphQL uses Document and Variables (spec §20, §44).
+// The two shapes coexist: a REST manifest never sets Document/Variables, and a
+// GraphQL manifest never sets the REST fields.
 type Request struct {
 	Method  string            `yaml:"method,omitempty" json:"method,omitempty"`
 	Path    string            `yaml:"path,omitempty" json:"path,omitempty"`
 	Query   map[string]string `yaml:"query,omitempty" json:"query,omitempty"`
 	Headers map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
 	Body    any               `yaml:"body,omitempty" json:"body,omitempty"`
+
+	// Document is the GraphQL operation text (a query or mutation). It is read
+	// only when protocol.type is graphql; a REST request leaves it empty
+	// (spec §44).
+	Document string `yaml:"document,omitempty" json:"document,omitempty"`
+
+	// Variables maps a GraphQL variable name to the operation input property
+	// that supplies it. An empty value means the variable resolves from an input
+	// property of the same name (spec §44). Variables used by the document that
+	// are absent from this map also default to a same-named input property.
+	Variables map[string]string `yaml:"variables,omitempty" json:"variables,omitempty"`
 }
 
 // Parse decodes a YAML manifest. It does not validate — call Validate.

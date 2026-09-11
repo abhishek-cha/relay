@@ -67,6 +67,9 @@ func (d *Document) Validate() error {
 	if d.Protocol.Type == "rest" && d.Protocol.BaseURL == "" {
 		add("protocol.baseUrl: required for rest")
 	}
+	if d.Protocol.Type == "graphql" && d.Protocol.Endpoint == "" {
+		add("protocol.endpoint: required for graphql")
+	}
 
 	if d.Auth != nil {
 		if d.Auth.Type == "" {
@@ -114,7 +117,7 @@ func (d *Document) Validate() error {
 				add("%s.input.required: %q is not a declared property", where, required)
 			}
 		}
-		validateRequest(where, tool, add)
+		validateRequest(where, d.Protocol.Type, tool, add)
 	}
 
 	if len(problems) > 0 {
@@ -124,7 +127,21 @@ func (d *Document) Validate() error {
 	return nil
 }
 
-func validateRequest(where string, tool Tool, add func(string, ...any)) {
+// validateRequest checks the shape of a single operation's request block. The
+// rules are protocol-specific: REST resolves path/query/header templates, while
+// GraphQL posts a document plus variable bindings (spec §20, §44). A protocol
+// with no defined request shape yet (grpc, browser, local) is checked against
+// the REST rules, which is the pre-M10 behaviour and keeps those manifests
+// loadable until their executors define a shape.
+func validateRequest(where, protocolType string, tool Tool, add func(string, ...any)) {
+	if protocolType == "graphql" {
+		validateGraphQLRequest(where, tool, add)
+		return
+	}
+	validateRESTRequest(where, tool, add)
+}
+
+func validateRESTRequest(where string, tool Tool, add func(string, ...any)) {
 	if tool.Request.Method == "" {
 		add("%s.request.method: required", where)
 	} else if !allowedMethods[strings.ToUpper(tool.Request.Method)] {
@@ -152,4 +169,68 @@ func validateRequest(where string, tool Tool, add func(string, ...any)) {
 			add("%s.request.path: {%s} must be listed in input.required", where, param)
 		}
 	}
+}
+
+// graphQLVariablePattern matches a GraphQL variable reference or declaration,
+// e.g. $id in `query GetUser($id: ID!) { user(id: $id) { name } }`. It is a
+// lexical approximation: variables are the only `$name` tokens a document uses,
+// so it is enough to know which inputs a query needs (spec §44).
+var graphQLVariablePattern = regexp.MustCompile(`\$([a-zA-Z_][a-zA-Z0-9_]*)`)
+
+// validateGraphQLRequest checks the fields the GraphQL executor actually needs:
+// a document, and an input property for every variable the document uses.
+func validateGraphQLRequest(where string, tool Tool, add func(string, ...any)) {
+	if tool.Request.Document == "" {
+		add("%s.request.document: required for graphql", where)
+	}
+
+	used := graphQLVariables(tool.Request.Document)
+	inDocument := make(map[string]bool, len(used))
+	for _, name := range used {
+		inDocument[name] = true
+		property := resolveVariableProperty(name, tool.Request.Variables)
+		if _, ok := tool.Input.Properties[property]; !ok {
+			add("%s.request.document: $%s resolves to input property %q, which is not declared", where, name, property)
+		}
+	}
+
+	// A mapping entry that the document never uses is still checked, so a typo
+	// in the mapping is caught rather than silently ignored. Entries for used
+	// variables were already covered above.
+	for name := range tool.Request.Variables {
+		if inDocument[name] {
+			continue
+		}
+		property := resolveVariableProperty(name, tool.Request.Variables)
+		if _, ok := tool.Input.Properties[property]; !ok {
+			add("%s.request.variables: %q maps to input property %q, which is not declared", where, name, property)
+		}
+	}
+}
+
+// resolveVariableProperty returns the input property a GraphQL variable reads
+// from. The mapping wins when it names one; otherwise the variable name is the
+// property name, matching the executor's resolution exactly.
+func resolveVariableProperty(variable string, mapping map[string]string) string {
+	if property, ok := mapping[variable]; ok && property != "" {
+		return property
+	}
+	return variable
+}
+
+// graphQLVariables returns the sorted, de-duplicated variable names a document
+// references.
+func graphQLVariables(document string) []string {
+	seen := map[string]bool{}
+	var names []string
+	for _, match := range graphQLVariablePattern.FindAllStringSubmatch(document, -1) {
+		name := match[1]
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }

@@ -42,6 +42,13 @@ type Spec struct {
 	Query    map[string]string
 	Headers  map[string]string
 	Body     any
+
+	// Document is the GraphQL operation text (a query or mutation) and
+	// Variables maps a GraphQL variable name to the operation input property
+	// that supplies it (spec §44). Both stay empty for every other protocol,
+	// so a REST spec is unchanged.
+	Document  string
+	Variables map[string]string
 }
 
 // Credential is a resolved secret plus how to present it. Keep the secret
