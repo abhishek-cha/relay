@@ -1,41 +1,144 @@
-# Draft example — real endpoint, not yet exercised against the live API.
-# Slack returns HTTP 200 with {"ok": false, "error": "..."} on failure, so the
-# REST executor will need Slack-aware error mapping before this is trustworthy.
+# Slack workspace operations, modeled on the Slack Web API.
+#
+# Two Slack-specific facts shape this manifest:
+#
+#   1. Every method lives under https://slack.com/api and is reached with the
+#      method name as the path (https://slack.com/api/conversations.list).
+#   2. Slack answers almost everything with HTTP 200 and puts the real outcome
+#      in an "ok" boolean, so a failed call is not a failed HTTP status. The
+#      REST executor maps HTTP status only, so an agent has to read "ok" from
+#      the result. See SKILL.md.
+#
+# Auth is a bearer token (auth type: bearer). The daemon owns the secret and
+# injects the Authorization header; it never appears here (spec 21, 22).
+#
+# POST operations declare no explicit request body: the REST executor sends
+# every input that no path/query/header template consumed as a JSON body, which
+# is exactly the Slack method-argument shape (spec 8, 20).
 apiVersion: relay/v1
 kind: Tool
 metadata:
   name: slack
   version: 0.1.0
-  description: Slack workspace operations
+  description: Slack workspace operations — conversations, messages, and users
+
 runtime:
   name: relay
   apiVersion: v1
+
 protocol:
   type: rest
   baseUrl: https://slack.com/api
+
 auth:
   type: bearer
   provider: slack
+
 capabilities:
   - network
   - keychain
+
 permissions:
   network:
     hosts:
       - slack.com
+
 tools:
+  - name: auth_test
+    description: Verify the credential and identify the workspace, bot, and user it belongs to
+    input:
+      type: object
+    request:
+      method: POST
+      path: /auth.test
+
   - name: list_conversations
-    description: List conversations the token can see
+    description: List the conversations (channels) the token can see
     input:
       type: object
       properties:
         types:
           type: string
-          description: Comma-separated conversation types, e.g. public_channel
+          description: Comma-separated conversation types, e.g. public_channel,private_channel
+          default: public_channel
+        exclude_archived:
+          type: boolean
+          description: Exclude archived conversations
+        limit:
+          type: integer
+          description: Maximum number of conversations to return per page (Slack caps this at 999)
+        cursor:
+          type: string
+          description: Pagination cursor from a previous response
+    request:
+      method: POST
+      path: /conversations.list
+
+  - name: conversations_history
+    description: Fetch recent messages from a conversation
+    input:
+      type: object
+      properties:
+        channel:
+          type: string
+          description: Conversation id, e.g. C0123ABCDEF (not the channel name)
+        limit:
+          type: integer
+          description: Maximum number of messages to return per page
+        cursor:
+          type: string
+          description: Pagination cursor from a previous response
+        oldest:
+          type: string
+          description: Only messages after this Unix timestamp (exclusive)
+        latest:
+          type: string
+          description: Only messages before this Unix timestamp (inclusive)
       required:
-        - types
+        - channel
     request:
       method: GET
-      path: /conversations.list
+      path: /conversations.history
       query:
-        types: "{types}"
+        channel: "{channel}"
+        limit: "{limit}"
+        cursor: "{cursor}"
+        oldest: "{oldest}"
+        latest: "{latest}"
+
+  - name: post_message
+    description: Post a message to a conversation
+    input:
+      type: object
+      properties:
+        channel:
+          type: string
+          description: Conversation id to post into
+        text:
+          type: string
+          description: Message text (Slack mrkdwn by default)
+        thread_ts:
+          type: string
+          description: Timestamp of the parent message to reply in a thread
+      required:
+        - channel
+        - text
+    request:
+      method: POST
+      path: /chat.postMessage
+
+  - name: get_user
+    description: Look up a single user by id
+    input:
+      type: object
+      properties:
+        user:
+          type: string
+          description: User id, e.g. U0123ABCDEF
+      required:
+        - user
+    request:
+      method: GET
+      path: /users.info
+      query:
+        user: "{user}"

@@ -141,13 +141,15 @@ Responsibilities:
 
 Examples:
 
-relay build github.yaml
+relay build github.yaml --skill SKILL.md
 relay install ./github
 relay list
 relay inspect github
-relay daemon
-relay logs
+relay daemon start
+relay logs -n 50
 relay mcp
+relay auth status github
+relay stats
 
 ⸻
 
@@ -241,13 +243,15 @@ Recommended Go repository:
 
 relay/
 ├── cmd/
-│   ├── relay/
-│   ├── relayd/
-│   └── relay-tool/
+│   ├── relay/          # developer/user CLI
+│   ├── relayd/         # the daemon
+│   └── relay-tool/     # the generic runtime, without embedded assets
 │
 ├── internal/
 │   ├── manifest/
 │   ├── runtime/
+│   ├── build/
+│   ├── skill/
 │   ├── daemon/
 │   ├── registry/
 │   ├── ipc/
@@ -255,26 +259,38 @@ relay/
 │   ├── keychain/
 │   ├── browser/
 │   ├── protocol/
-│   │   ├── rest/
-│   │   ├── graphql/
+│   │   ├── rest/       # REST executor
+│   │   ├── graphql/    # GraphQL executor
 │   │   └── grpc/
 │   ├── mcp/
 │   ├── telemetry/
-│   └── permissions/
+│   ├── permissions/
+│   ├── paths/
+│   └── fsutil/
 │
 ├── pkg/
-│   └── relay/
+│   ├── relay/          # public wire types + error model
+│   └── toolruntime/    # the runtime embedded into every built tool
 │
 ├── templates/
 │
 ├── examples/
-│   ├── github.yaml
-│   ├── slack.yaml
-│   └── stripe.yaml
+│   ├── github/         # github.yaml + SKILL.md (canonical pair)
+│   ├── slack/          # slack.yaml + SKILL.md
+│   ├── filesystem/     # filesystem.yaml + SKILL.md (local, not executable yet)
+│   └── stripe/         # stripe.yaml (manifest-only draft)
 │
 ├── skills/
 │
+├── docs/
+│   ├── DESIGN.md
+│   └── CONTRIBUTING.md
+│
+├── scripts/e2e.sh
+├── Makefile
 ├── go.mod
+├── go.sum
+├── TASKS.md
 └── README.md
 
 ⸻
@@ -384,8 +400,7 @@ When investigating a repository:
 
 1. Call `get_repository`.
 2. If the user asks about recent changes, call `list_pull_requests`.
-3. Inspect the relevant pull request before requesting its files.
-4. Prefer targeted requests rather than retrieving entire repositories.
+3. Read only what the task asks about rather than retrieving more than it needs.
 
 ## Pull Request Investigation
 
@@ -393,8 +408,6 @@ A useful sequence is:
 
 get_repository
 → list_pull_requests
-→ get_pull_request
-→ list_files
 
 The skill is guidance.
 
@@ -450,15 +463,23 @@ Example:
   "version": "1.0.0",
   "description": "GitHub repository and pull request operations",
   "protocol": "rest",
+  "runtime": {
+    "name": "relay",
+    "apiVersion": "v1"
+  },
   "skill": true,
+  "capabilities": [
+    "network",
+    "keychain"
+  ],
   "tools": [
     {
       "name": "get_repository",
-      "description": "Get repository information"
+      "description": "Get information about a GitHub repository"
     },
     {
       "name": "list_pull_requests",
-      "description": "List pull requests"
+      "description": "List pull requests for a repository"
     }
   ]
 }
@@ -543,9 +564,9 @@ The CLI should also support JSON input for complex objects:
 
 github get-repository --input request.json
 
-Eventually:
-
 github get-repository --input-json '{"owner":"openai","repo":"relay"}'
+
+Both are implemented; an explicitly passed flag wins over either form.
 
 ⸻
 
@@ -558,7 +579,7 @@ github/SKILL.md
 
 Build:
 
-relay build github.yaml
+relay build github.yaml --skill SKILL.md [--out PATH]
 
 Relay should:
 
@@ -575,7 +596,10 @@ Output:
 
 dist/github
 
-The generated binary should be self-contained.
+The generated binary should be self-contained. When `--out` is omitted the
+binary also gets a PATH shim in `~/.relay/bin`; `--source DIR` points the build
+at the Relay source tree explicitly, and `--keep` leaves the generated build
+directory in place for inspection.
 
 ⸻
 
@@ -655,15 +679,23 @@ Then:
 Registry example:
 
 ~/.relay/
+├── bin/
+│   └── github -> ../tools/github
+├── cache/
 ├── config/
+├── logs/
+│   └── daemon.log
 ├── registry/
 │   ├── github.json
 │   ├── slack.json
 │   └── stripe.json
 ├── run/
-│   └── daemon.sock
-├── logs/
-└── cache/
+│   ├── daemon.sock
+│   └── daemon.lock
+├── telemetry/
+│   └── usage.jsonl
+└── tools/
+    └── github
 
 ⸻
 
@@ -689,19 +721,11 @@ The registry is discovery metadata.
 
 17. Automatic Registration
 
-Eventually support:
-
-relay install ./github
-
-and optionally:
-
-./github --register
-
-or automatic registration on first execution.
-
-However, explicit installation should be the MVP.
-
-Automatic registration introduces security questions and should not complicate the initial implementation.
+Registration is explicit: `relay install ./github` is the only way a tool
+enters the registry. A tool binary carries no `--register` flag and there is no
+registration on first execution, so nothing a tool does can add itself to the
+registry. Automatic registration would raise questions the current model has no
+answer for and is deliberately out of scope.
 
 ⸻
 
@@ -772,12 +796,12 @@ Example:
 protocol:
   type: rest
 
-Future:
+GraphQL is implemented today:
 
 protocol:
   type: graphql
 
-or:
+gRPC is not:
 
 protocol:
   type: grpc
@@ -837,7 +861,8 @@ Auth Manager
  ↓
 macOS Keychain
 
-Possible credential types:
+Potential credential types (the validator accepts `api_key`, `bearer`,
+`basic`, `oauth2`, and `client_credentials` today; `mTLS` is not supported):
 
 API Key
 Bearer Token
@@ -1033,7 +1058,6 @@ Possible convention:
 
 github_get_repository
 github_list_pull_requests
-github_get_pull_request
 
 This makes tools easy to discover.
 
@@ -1101,12 +1125,10 @@ Better:
 When investigating a repository, first retrieve repository metadata
 before querying pull requests.
 
-For a pull request investigation, use:
+For a repository investigation, use:
 
 get_repository
 → list_pull_requests
-→ get_pull_request
-→ list_files
 
 ⸻
 
@@ -1119,10 +1141,6 @@ Example:
 get_repository
       ↓
 list_pull_requests
-      ↓
-get_pull_request
-      ↓
-list_files
 
 Relay can collect local usage statistics such as:
 
@@ -1140,7 +1158,6 @@ For example, if agents repeatedly use:
 
 get_repository
 → list_pull_requests
-→ get_pull_request
 
 the GitHub skill can explicitly recommend that workflow.
 
@@ -1188,8 +1205,6 @@ For example:
 Observed workflow:
 get_repository
 → list_pull_requests
-→ get_pull_request
-→ list_files
 
 Suggestion:
 Add "Pull Request Investigation" workflow
@@ -1273,9 +1288,13 @@ A skill describing behavior for version 1.4.0 should not accidentally be paired 
 
 37. Local Installation
 
-A simple MVP installation flow:
+A simple installation flow. There is no packaged installer yet (no Homebrew
+formula and no release artifact), so start by building the CLI and daemon from
+the source tree:
 
-brew install relay
+export PATH="$PATH:/usr/local/go/bin"
+make build                       # -> dist/relay, dist/relayd
+export PATH="$PWD/dist:$PATH"
 
 Then:
 
@@ -1312,11 +1331,11 @@ For example:
 ~/.relay/tools/slack
 ~/.relay/tools/stripe
 
-Relay can optionally add:
+Relay never edits your shell configuration. Add:
 
 ~/.relay/bin
 
-to the user's PATH.
+to your PATH yourself.
 
 Then:
 
@@ -1413,12 +1432,12 @@ github
 
 Inspect:
 
-./github --describe
-./github --skill
+./dist/github --describe
+./dist/github --skill
 
 Install:
 
-relay install ./github
+relay install ./dist/github
 
 Use:
 
@@ -1451,16 +1470,32 @@ kind: Tool
 metadata:
   name: github
   version: 1.0.0
-  description: GitHub API capabilities
+  description: GitHub repository and pull request operations
+
+runtime:
+  name: relay
+  apiVersion: v1
+
 protocol:
   type: rest
   baseUrl: https://api.github.com
+
 auth:
   type: oauth2
   provider: github
+
+capabilities:
+  - network
+  - keychain
+
+permissions:
+  network:
+    hosts:
+      - api.github.com
+
 tools:
   - name: get_repository
-    description: Get repository metadata
+    description: Get information about a GitHub repository
     input:
       type: object
       properties:
@@ -1475,26 +1510,32 @@ tools:
       method: GET
       path: /repos/{owner}/{repo}
 
-Skill:
+  - name: list_pull_requests
+    description: List pull requests for a repository
+    input:
+      type: object
+      properties:
+        owner:
+          type: string
+        repo:
+          type: string
+        state:
+          type: string
+          enum:
+            - open
+            - closed
+            - all
+          default: open
+      required:
+        - owner
+        - repo
+    request:
+      method: GET
+      path: /repos/{owner}/{repo}/pulls
 
-# GitHub
-
-Use GitHub capabilities to inspect repositories and pull requests.
-
-## Repository Investigation
-
-Start with `get_repository` when repository metadata is needed.
-
-## Pull Requests
-
-For investigating a pull request:
-
-1. Identify the repository.
-2. List pull requests.
-3. Retrieve the relevant pull request.
-4. Retrieve changed files when necessary.
-
-Prefer targeted calls over retrieving unnecessary data.
+The skill is the guidance half and lives beside the manifest in
+`examples/github/SKILL.md`: when to use the tool, the recommended workflow, the
+pagination limit, and how to read the result. It is guidance, not a schema.
 
 Build:
 
@@ -1506,9 +1547,9 @@ github
 
 ⸻
 
-44. Future GraphQL
+44. GraphQL
 
-Once REST works, GraphQL can use the same architecture.
+GraphQL uses the same architecture as REST and has an executor in the daemon.
 
 Manifest:
 
@@ -1519,7 +1560,7 @@ protocol:
 Tool:
 
 request:
-  query: |
+  document: |
     query GetUser($id: ID!) {
       user(id: $id) {
         id
@@ -1587,6 +1628,9 @@ Relay becomes a capability layer, not an API wrapper.
 47. Future Tool Registry
 
 Eventually Relay can have a registry.
+
+Nothing in this section exists yet: there is no `relay search`, and `relay
+install` takes a local binary path, not a tool name.
 
 Example:
 
@@ -1748,8 +1792,12 @@ relay build
 relay install
 relay list
 relay inspect
-relay daemon
+relay daemon start|stop|restart|status|install
+relay logs
 relay mcp
+relay auth login|logout|status
+relay stats
+relay version
 
 ⸻
 
@@ -1939,17 +1987,17 @@ MCP permission bypass
 
 A complete test should look like:
 
-relay build examples/github.yaml
+relay build examples/github/github.yaml --skill examples/github/SKILL.md
 
 Then:
 
-./github --describe
+./dist/github --describe
 
 Verify manifest.
 
 Then:
 
-relay install ./github
+relay install ./dist/github
 
 Verify registry.
 
@@ -1999,7 +2047,7 @@ SKILL.md
 
 3. Build one binary
 
-relay build github.yaml
+relay build github.yaml --skill SKILL.md
 
 4. Distribute it
 
@@ -2007,7 +2055,7 @@ github
 
 5. Install it
 
-relay install github
+relay install ./github
 
 6. Inspect it
 
