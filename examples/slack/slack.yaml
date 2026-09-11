@@ -1,0 +1,41 @@
+# Draft example — real endpoint, not yet exercised against the live API.
+# Slack returns HTTP 200 with {"ok": false, "error": "..."} on failure, so the
+# REST executor will need Slack-aware error mapping before this is trustworthy.
+apiVersion: relay/v1
+kind: Tool
+metadata:
+  name: slack
+  version: 0.1.0
+  description: Slack workspace operations
+runtime:
+  name: relay
+  apiVersion: v1
+protocol:
+  type: rest
+  baseUrl: https://slack.com/api
+auth:
+  type: bearer
+  provider: slack
+capabilities:
+  - network
+  - keychain
+permissions:
+  network:
+    hosts:
+      - slack.com
+tools:
+  - name: list_conversations
+    description: List conversations the token can see
+    input:
+      type: object
+      properties:
+        types:
+          type: string
+          description: Comma-separated conversation types, e.g. public_channel
+      required:
+        - types
+    request:
+      method: GET
+      path: /conversations.list
+      query:
+        types: "{types}"

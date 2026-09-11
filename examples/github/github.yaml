@@ -1,0 +1,73 @@
+apiVersion: relay/v1
+kind: Tool
+metadata:
+  name: github
+  version: 1.0.0
+  description: GitHub repository and pull request operations
+
+# Which Relay runtime this tool requires (spec §35). The daemon rejects tools
+# that declare a runtime version it does not support.
+runtime:
+  name: relay
+  apiVersion: v1
+
+protocol:
+  type: rest
+  baseUrl: https://api.github.com
+
+# The manifest states the requirement; the daemon owns the credential and keeps
+# it in the macOS Keychain (spec §21, §22).
+auth:
+  type: oauth2
+  provider: github
+
+capabilities:
+  - network
+  - keychain
+
+permissions:
+  network:
+    hosts:
+      - api.github.com
+
+tools:
+  - name: get_repository
+    description: Get information about a GitHub repository
+    input:
+      type: object
+      properties:
+        owner:
+          type: string
+          description: Repository owner (user or organization)
+        repo:
+          type: string
+          description: Repository name
+      required:
+        - owner
+        - repo
+    request:
+      method: GET
+      path: /repos/{owner}/{repo}
+
+  - name: list_pull_requests
+    description: List pull requests for a repository
+    input:
+      type: object
+      properties:
+        owner:
+          type: string
+        repo:
+          type: string
+        state:
+          type: string
+          enum:
+            - open
+            - closed
+            - all
+          default: open
+      required:
+        - owner
+        - repo
+    request:
+      method: GET
+      path: /repos/{owner}/{repo}/pulls

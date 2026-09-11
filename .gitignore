@@ -1,0 +1,17 @@
+# Build output
+/dist/
+/bin/
+
+# Generated single-tool binaries
+/relay
+/relayd
+
+# Go
+*.test
+*.out
+
+# Local runtime state (never commit credentials or telemetry)
+.relay/
+
+# macOS
+.DS_Store

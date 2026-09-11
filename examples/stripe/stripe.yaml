@@ -1,0 +1,39 @@
+# Draft example — real endpoint, not yet exercised against the live API.
+apiVersion: relay/v1
+kind: Tool
+metadata:
+  name: stripe
+  version: 0.1.0
+  description: Stripe billing operations
+runtime:
+  name: relay
+  apiVersion: v1
+protocol:
+  type: rest
+  baseUrl: https://api.stripe.com
+auth:
+  type: bearer
+  provider: stripe
+capabilities:
+  - network
+  - keychain
+permissions:
+  network:
+    hosts:
+      - api.stripe.com
+tools:
+  - name: list_customers
+    description: List customers
+    input:
+      type: object
+      properties:
+        limit:
+          type: integer
+          description: Number of customers to return (1-100)
+      required:
+        - limit
+    request:
+      method: GET
+      path: /v1/customers
+      query:
+        limit: "{limit}"

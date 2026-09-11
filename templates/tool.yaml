@@ -1,0 +1,39 @@
+# Template manifest. Copy to <tool>/<tool>.yaml and fill in.
+#
+# The manifest is machine truth: it declares what operations exist and what
+# inputs they require. Workflow guidance for an agent belongs in SKILL.md.
+apiVersion: relay/v1
+kind: Tool
+metadata:
+  name: mytool
+  version: 0.1.0
+  description: One line describing what this tool can do
+runtime:
+  name: relay
+  apiVersion: v1
+protocol:
+  type: rest
+  baseUrl: https://api.example.com
+auth:
+  type: api_key
+capabilities:
+  - network
+  - keychain
+permissions:
+  network:
+    hosts:
+      - api.example.com
+tools:
+  - name: get_thing
+    description: Get one thing by id
+    input:
+      type: object
+      properties:
+        id:
+          type: string
+          description: The thing's id
+      required:
+        - id
+    request:
+      method: GET
+      path: /things/{id}
