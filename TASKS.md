@@ -279,7 +279,7 @@ request input value finds nothing.
 ## M10 — Additional protocols  (§19, §23, §44, §45, §46, §58)
 
 - [x] `GraphQLExecutor` (`protocol.type: graphql`) — query and variables from the manifest; CLI and MCP unchanged — `internal/protocol/graphql`
-- [ ] `GRPCExecutor` (`protocol.type: grpc`) — service and method from the manifest; reflection or bundled descriptors
+- [x] `GRPCExecutor` (`protocol.type: grpc`) — address from `protocol.endpoint`, method from `request.path` (`/package.Service/Method`), JSON message body; descriptors resolved through server reflection v1, so no generated stubs. Failures map onto §26: `NETWORK_ERROR`, `TIMEOUT`, `REMOTE_ERROR` with the status code, `PROTOCOL_ERROR` for an unresolvable method — `internal/protocol/grpc`
 - [ ] `BrowserExecutor` (§23) — shared login, cookies, sessions, OAuth, web interaction
 
 ---

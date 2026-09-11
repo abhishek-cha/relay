@@ -1583,15 +1583,40 @@ Only the protocol executor changes.
 
 ⸻
 
-45. Future gRPC
+45. gRPC
 
-Similarly:
+Implemented by GRPCExecutor behind the same protocol.Executor seam as REST and
+GraphQL. The server address comes from the protocol block, and each operation
+names its method as the canonical gRPC path in the request block:
 
 protocol:
   type: grpc
-  service:
-    package: example.user
-    name: UserService
+  endpoint: localhost:50051
+
+tools:
+  - name: get_user
+    input:
+      type: object
+      properties:
+        id:
+          type: string
+      required:
+        - id
+    request:
+      method: POST
+      path: /example.user.UserService/GetUser
+
+The executor resolves the request and response message descriptors through
+server reflection at call time, so a tool needs no generated Go stubs. It sends
+the declared request.body (or the operation input when no body is declared) as
+protojson and returns the response as JSON, so the wire shape the CLI and MCP
+surfaces see is the same JSON shape REST and GraphQL produce. Manifest headers
+become gRPC metadata, the daemon-injected credential is attached the way it is
+for REST, and the call's deadline comes from the context. Failures map onto the
+shared taxonomy (§26): an unreachable server is NETWORK_ERROR, an expired
+deadline is TIMEOUT, any other non-OK status is REMOTE_ERROR naming the status
+code, and a malformed request block or unresolvable method is PROTOCOL_ERROR (a
+missing address is INVALID_INPUT).
 
 The daemon routes execution to:
 
