@@ -1,3 +1,9 @@
+---
+# Optional. When present, version must equal the manifest's metadata.version,
+# or the build fails (spec §36). Delete this block to declare no version.
+version: 0.1.0
+---
+
 # <Tool>
 
 Use this tool to <one sentence in the user's terms — what capability it adds,
@@ -61,3 +67,7 @@ formats, and fields that are easy to misread.>
 This template is guidance, not a schema. Do not restate the manifest's inputs or
 outputs here — a build-time linter rejects skills that do (spec §30). The
 manifest is machine truth; this file is how an agent should use it.
+
+The optional `version:` in the frontmatter above pins the skill to the manifest
+it ships with; when it is present it must match `metadata.version` (spec §36).
+Omit it and the skill carries no version and still builds.

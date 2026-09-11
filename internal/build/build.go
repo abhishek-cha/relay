@@ -70,6 +70,12 @@ func Build(ctx context.Context, opts Options) (*Result, error) {
 	if err := lintSkill(skillBytes, doc, opts.Verbose); err != nil {
 		return nil, err
 	}
+	// The skill and the manifest are versioned together (spec §36): a skill that
+	// declares a version must agree with the manifest it ships with, or guidance
+	// written for one revision would silently ride along with another.
+	if err := checkSkillVersion(opts.SkillPath, skillBytes, doc); err != nil {
+		return nil, err
+	}
 
 	sourceRoot, err := findSourceRoot(opts.SourceRoot)
 	if err != nil {
@@ -187,6 +193,36 @@ func lintSkill(skillBytes []byte, doc *manifest.Document, verbose bool) error {
 		return fmt.Errorf("skill does not meet §30: %s", strings.Join(failures, "; "))
 	}
 	return nil
+}
+
+// checkSkillVersion enforces spec §36: when a skill declares a version it must
+// equal the manifest's metadata.version, and a mismatch is a build error, not a
+// warning. A skill without a version marker (the empty case, or the common
+// backward-compatible case) is accepted unchanged, so existing skills keep
+// building.
+func checkSkillVersion(skillPath string, skillBytes []byte, doc *manifest.Document) error {
+	if len(skillBytes) == 0 {
+		return nil
+	}
+	declared, ok, err := skill.Version(skillBytes)
+	if err != nil {
+		return fmt.Errorf("skill %s: %w", skillName(skillPath), err)
+	}
+	if !ok {
+		return nil
+	}
+	if declared != doc.Metadata.Version {
+		return fmt.Errorf("skill %s declares version %q but the manifest metadata.version is %q; version the skill and manifest together (spec §36)", skillName(skillPath), declared, doc.Metadata.Version)
+	}
+	return nil
+}
+
+// skillName is the label used in errors when a skill path is unavailable.
+func skillName(path string) string {
+	if path == "" {
+		return "SKILL.md"
+	}
+	return filepath.Base(path)
 }
 
 func loadSkill(path string, verbose bool) ([]byte, error) {
