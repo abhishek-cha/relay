@@ -27,6 +27,7 @@ import (
 	"relay/internal/mcp"
 	"relay/internal/paths"
 	"relay/internal/registry"
+	"relay/internal/sign"
 	"relay/internal/telemetry"
 	"relay/pkg/relay"
 )
@@ -45,6 +46,8 @@ Usage:
 Commands:
   build     Build a tool binary from a manifest
   install   Install and register a tool binary
+  keygen    Generate an ed25519 signing keypair
+  sign      Sign a built tool binary so install can verify it
   list      List registered tools
   inspect   Show a registered tool's descriptor
   daemon    Manage the Relay daemon (start|stop|restart|status|install)
@@ -79,6 +82,10 @@ func run(args []string) int {
 		return runBuild(args[1:])
 	case "install":
 		return runInstall(args[1:])
+	case "keygen":
+		return runKeygen(args[1:])
+	case "sign":
+		return runSign(args[1:])
 	case "list":
 		return runList(args[1:])
 	case "inspect":
@@ -221,6 +228,145 @@ func runInstall(args []string) int {
 
 	fmt.Printf("installed %s (%s)\n", resp.Tool, absPath)
 	return 0
+}
+
+// ─── keygen / sign ──────────────────────────────────────────────────────────
+
+// runKeygen generates an ed25519 signing keypair so a publisher can sign a built
+// tool (spec §48).
+func runKeygen(args []string) int {
+	flags := flag.NewFlagSet("relay keygen", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	flags.Usage = func() {
+		fmt.Fprint(os.Stderr, "usage: relay keygen [--out DIR] [--force]\n")
+		flags.PrintDefaults()
+	}
+	outDir := flags.String("out", ".", "directory for the key files")
+	force := flags.Bool("force", false, "overwrite existing key files")
+	if err := flags.Parse(permute(flags, args)); err != nil {
+		return 2
+	}
+	if flags.NArg() != 0 {
+		flags.Usage()
+		return 2
+	}
+
+	privatePath := filepath.Join(*outDir, "relay-signing.key")
+	publicPath := filepath.Join(*outDir, "relay-signing.pub")
+	if !*force {
+		for _, path := range []string{privatePath, publicPath} {
+			if _, err := os.Stat(path); err == nil {
+				fmt.Fprintf(os.Stderr, "relay: %s already exists; pass --force to overwrite\n", path)
+				return 1
+			}
+		}
+	}
+
+	public, private, err := sign.GenerateKey()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "relay: generate key: %v\n", err)
+		return 1
+	}
+	if err := os.WriteFile(privatePath, []byte(sign.EncodePrivateKey(private)+"\n"), 0o600); err != nil {
+		fmt.Fprintf(os.Stderr, "relay: write %s: %v\n", privatePath, err)
+		return 1
+	}
+	if err := os.WriteFile(publicPath, []byte(sign.EncodePublicKey(public)+"\n"), 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "relay: write %s: %v\n", publicPath, err)
+		return 1
+	}
+
+	// stdout is the result a caller pins in a trust policy: the key fingerprint.
+	fmt.Println(sign.KeyFingerprint(public))
+	fmt.Fprintf(os.Stderr, "relay: wrote %s and %s\n", privatePath, publicPath)
+	return 0
+}
+
+// runSign signs a built tool binary, writing the sidecar signature that
+// `relay install` verifies (spec §48).
+func runSign(args []string) int {
+	flags := flag.NewFlagSet("relay sign", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	flags.Usage = func() {
+		fmt.Fprint(os.Stderr, "usage: relay sign <tool-binary> --key KEYFILE [--publisher NAME] [--out PATH]\n")
+		flags.PrintDefaults()
+	}
+	keyPath := flags.String("key", "", "ed25519 private key written by 'relay keygen'")
+	publisher := flags.String("publisher", "", "publisher label bound into the signature")
+	outPath := flags.String("out", "", "signature path (default <tool-binary>.sig)")
+	if err := flags.Parse(permute(flags, args)); err != nil {
+		return 2
+	}
+	if flags.NArg() != 1 || *keyPath == "" {
+		flags.Usage()
+		return 2
+	}
+
+	binary, err := filepath.Abs(flags.Arg(0))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "relay: cannot resolve %q: %v\n", flags.Arg(0), err)
+		return 1
+	}
+	keyData, err := os.ReadFile(*keyPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "relay: read key: %v\n", err)
+		return 1
+	}
+	private, err := sign.ParsePrivateKey(string(keyData))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "relay: %v\n", err)
+		return 1
+	}
+
+	describe, err := runToolBinary(binary, "--describe")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "relay: %v\n", err)
+		return 1
+	}
+	manifest, err := runToolBinary(binary, "--manifest")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "relay: %v\n", err)
+		return 1
+	}
+	var descriptor relay.Descriptor
+	if err := json.Unmarshal(describe, &descriptor); err != nil {
+		fmt.Fprintf(os.Stderr, "relay: %s --describe is not a Relay descriptor: %v\n", binary, err)
+		return 1
+	}
+	digest, err := sign.DigestFile(binary)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "relay: hash %s: %v\n", binary, err)
+		return 1
+	}
+
+	signature, err := sign.Sign(private, *publisher, descriptor.Name, descriptor.Version, manifest, describe, digest, time.Now())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "relay: sign: %v\n", err)
+		return 1
+	}
+	if *outPath == "" {
+		*outPath = sign.SignaturePath(binary)
+	}
+	if err := sign.Save(*outPath, signature); err != nil {
+		fmt.Fprintf(os.Stderr, "relay: write signature: %v\n", err)
+		return 1
+	}
+
+	fmt.Println(*outPath)
+	fmt.Fprintf(os.Stderr, "relay: signed %s %s as %q (key %s)\n",
+		descriptor.Name, descriptor.Version, *publisher, signature.KeyFingerprint)
+	return 0
+}
+
+// runToolBinary runs a built or installed tool's discovery flag and returns its
+// stdout. The signature covers these exact bytes, so they are fetched from the
+// binary rather than reconstructed.
+func runToolBinary(binary, flagArg string) ([]byte, error) {
+	output, err := exec.Command(binary, flagArg).Output()
+	if err != nil {
+		return nil, fmt.Errorf("%s %s: %w", binary, flagArg, err)
+	}
+	return output, nil
 }
 
 // ─── list ───────────────────────────────────────────────────────────────────
@@ -974,6 +1120,14 @@ func runAuthLogin(args []string) int {
 		return 2
 	}
 
+	// An oauth2 tool whose manifest declares the device endpoints logs in
+	// without the user ever handling a token (spec §21, §54).
+	if authType == "oauth2" {
+		if code, handled := runDeviceLogin(tool); handled {
+			return code
+		}
+	}
+
 	secret, err := readSecret(fmt.Sprintf("Secret for %s (%s): ", tool, authType))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "relay: %v\n", err)
@@ -995,6 +1149,68 @@ func runAuthLogin(args []string) int {
 	}
 	fmt.Printf("stored %s credential for %s\n", authType, tool)
 	return 0
+}
+
+// runDeviceLogin runs the OAuth2 device authorization grant when the tool's
+// manifest declares one (spec §21, §54).
+//
+// The daemon owns the whole exchange: it holds the device code, polls the
+// authorization server, and writes the token straight to the Keychain. This
+// function only shows the user the code and where to type it, so no token ever
+// reaches the CLI (spec §22).
+//
+// It reports handled=false for the one case that is not a failure: an oauth2
+// tool that declares no device endpoints, which keeps the pasted-token path
+// that has always worked. Any other reason the flow cannot run also falls back,
+// with the diagnostic on stderr, so a manifest that predates this feature is
+// never worse off than before.
+func runDeviceLogin(tool string) (int, bool) {
+	layout := paths.Default()
+	startRequest := ipc.AuthDeviceStartRequest{Type: ipc.FrameAuthDeviceStart, Tool: tool}
+	var start ipc.AuthDeviceStartResponse
+	if err := ipc.Call(context.Background(), layout.Socket(), &startRequest, &start); err != nil {
+		return reportIPCError(err), true
+	}
+	if !start.Success {
+		if start.Error == nil || start.Error.Details["deviceFlow"] != false {
+			fmt.Fprintf(os.Stderr, "relay: device login unavailable (%s); falling back to a pasted token\n",
+				deviceFlowReason(start.Error))
+		}
+		return 0, false
+	}
+
+	if start.VerificationURIComplete != "" {
+		fmt.Printf("Open %s and confirm the code %s\n", start.VerificationURIComplete, start.UserCode)
+	} else if start.VerificationURI != "" {
+		fmt.Printf("Open %s and enter the code %s\n", start.VerificationURI, start.UserCode)
+	}
+	if start.ExpiresIn > 0 {
+		fmt.Printf("The code expires in %d seconds; waiting for authorization...\n", start.ExpiresIn)
+	}
+
+	// The daemon polls until the human finishes, so the wait is bounded by the
+	// code's own expiry rather than the default exchange timeout.
+	timeout := time.Duration(start.ExpiresIn+30) * time.Second
+	waitRequest := ipc.AuthDeviceWaitRequest{Type: ipc.FrameAuthDeviceWait, Flow: start.Flow}
+	var wait ipc.AuthDeviceWaitResponse
+	if err := ipc.CallWithTimeout(context.Background(), layout.Socket(), timeout, &waitRequest, &wait); err != nil {
+		fmt.Fprintf(os.Stderr, "relay: %v\n", err)
+		return 1, true
+	}
+	if !wait.Success {
+		return reportResponseError(wait.Error, "complete the device login"), true
+	}
+	fmt.Printf("stored oauth2 credential for %s\n", tool)
+	return 0, true
+}
+
+// deviceFlowReason renders the daemon's reason for declining a device login
+// without ever echoing a value back: only the code is printed.
+func deviceFlowReason(structured *relay.Error) string {
+	if structured == nil {
+		return "no detail"
+	}
+	return string(structured.Code)
 }
 
 func runAuthLogout(args []string) int {

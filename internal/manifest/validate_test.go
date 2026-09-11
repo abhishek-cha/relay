@@ -309,6 +309,7 @@ func TestValidateAggregatesProblems(t *testing.T) {
 func TestValidateExampleManifests(t *testing.T) {
 	examples := []string{
 		"../../examples/github/github.yaml",
+		"../../examples/filesystem/filesystem.yaml",
 		"../../examples/slack/slack.yaml",
 		"../../examples/stripe/stripe.yaml",
 		"../../templates/tool.yaml",
@@ -352,5 +353,127 @@ func TestOperationLookup(t *testing.T) {
 	}
 	if doc.Operation("missing") != nil {
 		t.Fatal("expected nil for an undeclared operation")
+	}
+}
+
+// A local capability names the primitive it runs in request.operation and
+// carries none of the address-shaped fields the remote protocols use
+// (spec §19, §46).
+const validLocalManifest = `apiVersion: relay/v1
+kind: Tool
+metadata:
+  name: filesystem
+  version: 1.0.0
+  description: A local filesystem tool
+protocol:
+  type: local
+capabilities:
+  - filesystem.read
+permissions:
+  filesystem:
+    read:
+      - /tmp
+tools:
+  - name: read_file
+    description: Read a file
+    input:
+      type: object
+      properties:
+        path:
+          type: string
+      required:
+        - path
+    request:
+      operation: read_file
+`
+
+func TestValidateAcceptsValidLocalManifest(t *testing.T) {
+	if err := mustParse(t, validLocalManifest).Validate(); err != nil {
+		t.Fatalf("expected valid local manifest, got: %v", err)
+	}
+}
+
+// An operation naming a primitive this build does not implement still validates:
+// the schema layer checks the block's shape, and the executor is what rejects an
+// unimplemented primitive with PROTOCOL_ERROR (spec §19).
+func TestValidateAcceptsUnimplementedLocalPrimitive(t *testing.T) {
+	doc := mustParse(t, validLocalManifest)
+	doc.Tools[0].Request.Operation = "docker_run"
+	if err := doc.Validate(); err != nil {
+		t.Fatalf("an unimplemented primitive must still validate, got: %v", err)
+	}
+}
+
+func TestValidateRejectsLocal(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*Document)
+		wantErr string
+	}{
+		{
+			name:    "missing operation",
+			mutate:  func(d *Document) { d.Tools[0].Request.Operation = "" },
+			wantErr: "request.operation: required for local",
+		},
+		{
+			name:    "rest method present",
+			mutate:  func(d *Document) { d.Tools[0].Request.Method = "GET" },
+			wantErr: "request.method: not allowed for local",
+		},
+		{
+			name:    "rest path present",
+			mutate:  func(d *Document) { d.Tools[0].Request.Path = "/read_file" },
+			wantErr: "request.path: not allowed for local",
+		},
+		{
+			name:    "graphql document present",
+			mutate:  func(d *Document) { d.Tools[0].Request.Document = "query { x }" },
+			wantErr: "request.document: not allowed for local",
+		},
+		{
+			name:    "graphql variables present",
+			mutate:  func(d *Document) { d.Tools[0].Request.Variables = map[string]string{"id": "id"} },
+			wantErr: "request.variables: not allowed for local",
+		},
+		{
+			name:    "baseUrl present",
+			mutate:  func(d *Document) { d.Protocol.BaseURL = "https://example.test" },
+			wantErr: "protocol.baseUrl: not allowed for local",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			doc := mustParse(t, validLocalManifest)
+			test.mutate(doc)
+			err := doc.Validate()
+			if err == nil {
+				t.Fatalf("expected an error mentioning %q", test.wantErr)
+			}
+			if !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("expected error to mention %q, got: %v", test.wantErr, err)
+			}
+		})
+	}
+}
+
+// TestValidateAggregatesLocalProblems guards the all-at-once reporting property
+// for the local rules (spec §59).
+func TestValidateAggregatesLocalProblems(t *testing.T) {
+	doc := mustParse(t, validLocalManifest)
+	doc.Tools[0].Request.Operation = ""
+	doc.Tools[0].Request.Method = "GET"
+	doc.Tools[0].Request.Path = "/read_file"
+
+	err := doc.Validate()
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	validationErr, ok := err.(*ValidationError)
+	if !ok {
+		t.Fatalf("expected *ValidationError, got %T", err)
+	}
+	if len(validationErr.Problems) != 3 {
+		t.Fatalf("expected 3 problems, got %d: %v", len(validationErr.Problems), validationErr.Problems)
 	}
 }

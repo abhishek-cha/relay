@@ -67,6 +67,9 @@ func (d *Document) Validate() error {
 	if d.Protocol.Type == "rest" && d.Protocol.BaseURL == "" {
 		add("protocol.baseUrl: required for rest")
 	}
+	if d.Protocol.Type == "local" && d.Protocol.BaseURL != "" {
+		add("protocol.baseUrl: not allowed for local; a local capability has no service")
+	}
 	if d.Protocol.Type == "graphql" && d.Protocol.Endpoint == "" {
 		add("protocol.endpoint: required for graphql")
 	}
@@ -128,17 +131,52 @@ func (d *Document) Validate() error {
 }
 
 // validateRequest checks the shape of a single operation's request block. The
-// rules are protocol-specific: REST resolves path/query/header templates, while
-// GraphQL posts a document plus variable bindings (spec §20, §44). A protocol
-// with no defined request shape yet (grpc, browser, local) is checked against
-// the REST rules, which is the pre-M10 behaviour and keeps those manifests
-// loadable until their executors define a shape.
+// rules are protocol-specific: REST resolves path/query/header templates,
+// GraphQL posts a document plus variable bindings, and a local capability names
+// the primitive it runs (spec §19, §20, §44, §46). A protocol that still has no
+// defined request shape (grpc, browser) is checked against the REST rules,
+// which keeps those manifests loadable until their executors define a shape.
 func validateRequest(where, protocolType string, tool Tool, add func(string, ...any)) {
-	if protocolType == "graphql" {
+	switch protocolType {
+	case "graphql":
 		validateGraphQLRequest(where, tool, add)
-		return
+	case "local":
+		validateLocalRequest(where, tool, add)
+	default:
+		validateRESTRequest(where, tool, add)
 	}
-	validateRESTRequest(where, tool, add)
+}
+
+// validateLocalRequest checks the fields a local capability needs, and the
+// address-shaped fields it must not carry (spec §19, §46).
+//
+// A local operation does not contact a service, so its request block names the
+// primitive to invoke in request.operation and sets nothing that would describe
+// a transport. A method, path, document, or variable binding here is a manifest
+// author reaching for a remote shape by mistake, so it is rejected rather than
+// ignored; the executor would otherwise silently run something other than what
+// the manifest appears to describe.
+//
+// The validator checks that request.operation is present, not that this build
+// implements it: whether an executor exists is a runtime question, answered by
+// the executor registry with PROTOCOL_ERROR (spec §19), exactly as an unknown
+// protocol.type is. That keeps a tool built for a newer runtime installable.
+func validateLocalRequest(where string, tool Tool, add func(string, ...any)) {
+	if tool.Request.Operation == "" {
+		add("%s.request.operation: required for local", where)
+	}
+	if tool.Request.Method != "" {
+		add("%s.request.method: not allowed for local; name the primitive with request.operation", where)
+	}
+	if tool.Request.Path != "" {
+		add("%s.request.path: not allowed for local; name the primitive with request.operation", where)
+	}
+	if tool.Request.Document != "" {
+		add("%s.request.document: not allowed for local", where)
+	}
+	if len(tool.Request.Variables) > 0 {
+		add("%s.request.variables: not allowed for local", where)
+	}
 }
 
 func validateRESTRequest(where string, tool Tool, add func(string, ...any)) {

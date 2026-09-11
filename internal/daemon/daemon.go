@@ -205,6 +205,20 @@ func (d *Daemon) Handle(ctx context.Context, kind string, frame []byte) (any, er
 		}
 		return d.authStatus(ctx, request), nil
 
+	case ipc.FrameAuthDeviceStart:
+		var request ipc.AuthDeviceStartRequest
+		if failure := decode(frame, &request); failure != nil {
+			return failedDeviceStart(failure), nil
+		}
+		return d.authDeviceStart(ctx, request), nil
+
+	case ipc.FrameAuthDeviceWait:
+		var request ipc.AuthDeviceWaitRequest
+		if failure := decode(frame, &request); failure != nil {
+			return failedDeviceWait(failure), nil
+		}
+		return d.authDeviceWait(ctx, request), nil
+
 	default:
 		return map[string]any{
 			"success": false,
@@ -280,7 +294,7 @@ func (d *Daemon) invokeOperation(ctx context.Context, request relay.InvokeReques
 	// manifest is not entitled to run is refused here, so no secret leaves the
 	// Keychain and no request leaves the daemon on its behalf. This sits inside
 	// the timed invoke, so a denied call is still recorded as usage (spec §31).
-	if failure := d.permissionCheck(doc, operation.Name); failure != nil {
+	if failure := d.permissionCheck(doc, operation, request.Input); failure != nil {
 		return invokeFailure(failure)
 	}
 
@@ -410,11 +424,20 @@ func (d *Daemon) serverInfo() relay.ServerInfo {
 
 // specFor projects an operation's manifest request block into the
 // protocol-neutral shape an Executor consumes (spec §19).
+//
+// Endpoint is the Spec's protocol-specific destination slot. A remote protocol
+// takes its endpoint from the protocol block; a local capability has no
+// address, so it carries the primitive to run — the manifest's
+// request.operation — in that slot (spec §46).
 func specFor(doc *manifest.Document, operation *manifest.Tool) protocol.Spec {
+	endpoint := doc.Protocol.Endpoint
+	if doc.Protocol.Type == "local" {
+		endpoint = operation.Request.Operation
+	}
 	return protocol.Spec{
 		Type:     doc.Protocol.Type,
 		BaseURL:  doc.Protocol.BaseURL,
-		Endpoint: doc.Protocol.Endpoint,
+		Endpoint: endpoint,
 		Method:   operation.Request.Method,
 		Path:     operation.Request.Path,
 		Query:    operation.Request.Query,

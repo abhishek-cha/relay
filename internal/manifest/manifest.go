@@ -61,6 +61,13 @@ type Protocol struct {
 type Auth struct {
 	Type     string `yaml:"type" json:"type"`
 	Provider string `yaml:"provider,omitempty" json:"provider,omitempty"`
+	// The four fields below declare an OAuth2 device authorization grant
+	// (RFC 8628). They are additive: an oauth2 block that omits them keeps
+	// meaning "a human pastes a token" (spec §21, §54).
+	DeviceAuthorizationEndpoint string   `yaml:"deviceAuthorizationEndpoint,omitempty" json:"deviceAuthorizationEndpoint,omitempty"`
+	TokenEndpoint               string   `yaml:"tokenEndpoint,omitempty" json:"tokenEndpoint,omitempty"`
+	ClientID                    string   `yaml:"clientId,omitempty" json:"clientId,omitempty"`
+	Scopes                      []string `yaml:"scopes,omitempty" json:"scopes,omitempty"`
 }
 
 // Permissions is the declared policy surface (spec §25). Enforcement lands in a
@@ -108,9 +115,9 @@ type Property struct {
 }
 
 // Request describes how to reach the operation. REST uses Method, Path, Query,
-// Headers, and Body; GraphQL uses Document and Variables (spec §20, §44).
-// The two shapes coexist: a REST manifest never sets Document/Variables, and a
-// GraphQL manifest never sets the REST fields.
+// Headers, and Body; GraphQL uses Document and Variables; a local capability
+// uses Operation (spec §19, §20, §44, §46). The shapes coexist: a manifest sets
+// only the fields its protocol reads, and the validator rejects the others.
 type Request struct {
 	Method  string            `yaml:"method,omitempty" json:"method,omitempty"`
 	Path    string            `yaml:"path,omitempty" json:"path,omitempty"`
@@ -128,6 +135,12 @@ type Request struct {
 	// property of the same name (spec §44). Variables used by the document that
 	// are absent from this map also default to a same-named input property.
 	Variables map[string]string `yaml:"variables,omitempty" json:"variables,omitempty"`
+
+	// Operation names the local primitive to run, such as "read_file" or
+	// "git_status" (spec §46). It is read only when protocol.type is local; a
+	// local request names a primitive instead of an address, so it sets none of
+	// Method, Path, Query, Headers, Body, Document, or Variables.
+	Operation string `yaml:"operation,omitempty" json:"operation,omitempty"`
 }
 
 // Parse decodes a YAML manifest. It does not validate — call Validate.

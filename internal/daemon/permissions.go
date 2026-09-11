@@ -6,6 +6,7 @@ import (
 
 	"relay/internal/manifest"
 	"relay/internal/permissions"
+	"relay/internal/protocol/local"
 	"relay/pkg/relay"
 )
 
@@ -24,15 +25,29 @@ import (
 // copy. A destructive operation that is otherwise entitled is turned into a
 // PERMISSION_DENIED error that says confirmation is required; there is no
 // interactive prompt yet, so the call is refused rather than run.
-func (d *Daemon) permissionCheck(doc *manifest.Document, operation string) *relay.Error {
+//
+// Deriving the invocation can itself fail — a local operation naming a
+// primitive this build does not implement, or a target that cannot be resolved
+// to an absolute path. That error is returned as-is: an invocation the daemon
+// cannot classify is refused rather than run unchecked.
+func (d *Daemon) permissionCheck(doc *manifest.Document, operation *manifest.Tool, input map[string]any) *relay.Error {
+	invocation, failure := permissionInvocation(doc, operation, input)
+	if failure != nil {
+		return failure
+	}
 	policy := permissions.PolicyFromManifest(doc, d.destructiveOps)
-	failure := permissions.Check(policy, permissionInvocation(doc, operation))
+	// Canonicalize the declared scopes by the same rule the invocation's paths
+	// were resolved with, so a scope written as "~/Documents" or reached through
+	// a symlink matches the absolute path the request carries (spec §25, §40).
+	policy.Filesystem.Read = local.ResolveScopes(policy.Filesystem.Read)
+	policy.Filesystem.Write = local.ResolveScopes(policy.Filesystem.Write)
+	failure = permissions.Check(policy, invocation)
 	if failure == nil {
 		return nil
 	}
 	if failure.Code == permissions.CodeConfirmationRequired {
 		return relay.NewError(relay.CodePermissionDenied,
-			fmt.Sprintf("operation %q requires confirmation before it can run", operation)).
+			fmt.Sprintf("operation %q requires confirmation before it can run", operation.Name)).
 			WithDetails(failure.Details)
 	}
 	return failure
@@ -41,15 +56,17 @@ func (d *Daemon) permissionCheck(doc *manifest.Document, operation string) *rela
 // permissionInvocation states, in capability terms, what this operation is
 // about to do (spec §24, §25).
 //
-// Only the requirements the daemon can derive today are declared:
+// The requirements the daemon derives are:
 //
 //   - Network is the host a REST or GraphQL operation will contact, read from
 //     the protocol's baseUrl. A protocol with no baseUrl asserts no network.
 //   - Uses is keychain when the manifest declares an auth block, because the
 //     daemon will read a credential for it (spec §21, §22).
-//   - Reads and Writes stay empty: there is no local executor yet, and it — not
-//     the daemon — is the place that will know an operation's concrete paths
-//     (spec §19). When one lands it widens this invocation.
+//   - Reads and Writes are the concrete, resolved paths a local operation will
+//     touch, derived from the primitive its request block names and the
+//     operation input (spec §46). The executor resolves the target by the same
+//     rule, so the path checked here is the path acted on. No other protocol
+//     states filesystem requirements.
 //
 // A manifest that declares neither capabilities nor permissions predates the
 // capability model, so there is nothing to enforce against it: it states no
@@ -59,14 +76,28 @@ func (d *Daemon) permissionCheck(doc *manifest.Document, operation string) *rela
 // default-deny — a capability it did not name is refused, and a host it did not
 // scope is refused (spec §24).
 //
+// A local capability is the one exception to that opt-in: it always touches a
+// path, so it always participates, even when its manifest declares no
+// capability block. A local tool that declares nothing therefore has every path
+// requirement denied for want of a filesystem capability, which is the correct
+// default-deny reading — a local capability has no pre-model form to preserve.
+//
 // The destructive gate is deliberately not part of this opt-out: it is driven
 // by daemon configuration rather than by the manifest, so a destructive
 // operation is gated whenever the daemon names it, whether or not the tool
 // declares a capability surface.
-func permissionInvocation(doc *manifest.Document, operation string) permissions.Invocation {
-	invocation := permissions.Invocation{Operation: operation}
-	if !participatesInCapabilityModel(doc) {
-		return invocation
+func permissionInvocation(doc *manifest.Document, operation *manifest.Tool, input map[string]any) (permissions.Invocation, *relay.Error) {
+	invocation := permissions.Invocation{Operation: operation.Name}
+
+	if doc.Protocol.Type == "local" {
+		requirement, failure := local.Requirements(operation.Request.Operation, input)
+		if failure != nil {
+			return permissions.Invocation{}, failure
+		}
+		invocation.Reads = requirement.Reads
+		invocation.Writes = requirement.Writes
+	} else if !participatesInCapabilityModel(doc) {
+		return invocation, nil
 	}
 	if host := protocolHost(doc.Protocol); host != "" {
 		invocation.Network = []string{host}
@@ -74,7 +105,7 @@ func permissionInvocation(doc *manifest.Document, operation string) permissions.
 	if doc.Auth != nil {
 		invocation.Uses = []string{permissions.CapabilityKeychain}
 	}
-	return invocation
+	return invocation, nil
 }
 
 // participatesInCapabilityModel reports whether a manifest has declared the

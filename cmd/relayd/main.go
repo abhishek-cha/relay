@@ -23,6 +23,7 @@ import (
 	"relay/internal/paths"
 	"relay/internal/protocol"
 	"relay/internal/protocol/graphql"
+	"relay/internal/protocol/local"
 	"relay/internal/protocol/rest"
 	"relay/internal/telemetry"
 )
@@ -99,9 +100,9 @@ func run(args []string) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// REST and GraphQL have executors (spec §20, §44). A manifest asking for
-	// grpc, browser, or local is rejected with PROTOCOL_ERROR rather than
-	// guessed at, so the rejection stays honest as new executors land
+	// REST, GraphQL, and local capabilities have executors (spec §20, §44, §46).
+	// A manifest asking for grpc or browser is rejected with PROTOCOL_ERROR
+	// rather than guessed at, so the rejection stays honest as new executors land
 	// (spec §19).
 	d := daemon.New(daemon.Config{
 		Layout:    layout,
@@ -112,6 +113,7 @@ func run(args []string) int {
 		Executors: map[string]protocol.Executor{
 			"rest":    rest.New(),
 			"graphql": graphql.New(),
+			"local":   local.New(),
 		},
 	})
 
