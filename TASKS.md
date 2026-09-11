@@ -137,6 +137,8 @@ is honoured in its delay-seconds form (capped); the HTTP-date form is not parsed
 Path placeholders are `url.PathEscape`d, while query and header values are substituted
 raw so `url.Values.Encode` owns query encoding.
 
+**Implemented in:** `internal/protocol/rest`, dispatched from `internal/daemon`.
+
 **Acceptance:** `github get_repository` and `list_pull_requests` work against GitHub (or a mock); the error taxonomy is verified against mocked 401/403/404/429/500.
 
 ---
@@ -145,12 +147,22 @@ raw so `url.Values.Encode` owns query encoding.
 
 **Goal:** credentials live in the daemon and only in Keychain.
 
-- [ ] Credential types: API key, bearer token, basic auth, client credentials, OAuth2
-- [ ] macOS Keychain via the `security` CLI (or Security.framework); namespace `com.relay.<tool>`, account `default`
-- [ ] `relay auth login <tool>` / `logout` / `status`; OAuth2 device-code or PKCE foundation
-- [ ] Daemon injects credentials at execution time (§22); the tool binary never handles secrets
-- [ ] Redaction guarantees: secrets absent from CLI output, MCP output, logs, telemetry, manifests, skills
-- [ ] `AUTH_REQUIRED` / `AUTH_FAILED` surfaced identically to CLI and MCP
+- [x] Credential types: API key, bearer token, basic auth, client credentials, OAuth2 — `internal/auth`
+- [x] macOS Keychain via the `security` CLI (or Security.framework); namespace `com.relay.<tool>`, account `default` — `internal/keychain`
+- [x] `relay auth login <tool>` / `logout` / `status` — the CLI hands the secret to the daemon once and never stores or echoes it
+- [ ] OAuth2 device-code or PKCE flow — `relay auth login` stores an already-issued token; the flow choice is still open decision #5
+- [x] Daemon injects credentials at execution time (§22); the tool binary never handles secrets — resolved through `auth.Resolver`
+- [x] Redaction guarantees: secrets absent from CLI output, MCP output, logs, telemetry, manifests, skills — `internal/keychain/redact.go`
+- [x] `AUTH_REQUIRED` / `AUTH_FAILED` surfaced identically to CLI and MCP
+
+**Implemented in:** `internal/auth`, `internal/keychain`, `internal/daemon/auth.go`, `cmd/relay/main.go`.
+
+**Decisions taken:**
+
+- **Five credential types, one presentation table.** Each declared type maps to a conventional header: `api_key` to `X-API-Key`, `bearer` and `oauth2` to `Authorization: Bearer`, and `basic` plus `client_credentials` to HTTP Basic. No executor branches on the auth type, so the protocol stays an implementation detail (§19).
+- **The CLI never stores a secret.** `relay auth login` reads it with echo disabled (or from stdin when unattended) and hands it to the daemon, the only writer of Keychain. There is deliberately no `--secret` flag, because argv is visible to `ps`.
+
+**Verified:** an isolated `RELAY_HOME` round-trip — `relay auth login github` wrote `com.relay.github` to Keychain, `relay auth status` reported `authType: oauth2`, `relay auth logout` removed it, and `security find-generic-password -s com.relay.github` then reported the item missing. Grepping the temp home for the planted secret found nothing.
 
 **Acceptance:** a secret stored in Keychain is used on invoke; a missing credential yields `AUTH_REQUIRED`; `relay logs` and telemetry contain no secret; grepping every artifact finds no token.
 
@@ -160,12 +172,16 @@ raw so `url.Values.Encode` owns query encoding.
 
 **Goal:** every binary carries AI guidance and can serve it.
 
-- [ ] `SKILL.md` embedded alongside the manifest at build time; versioned together with it (§36)
-- [ ] `--skill` prints it; the daemon can serve it over IPC
-- [ ] Skill linter: reject skills that restate the input schema (§30); require workflow/sequence guidance
-- [ ] `templates/SKILL.md` starting point
+- [x] `SKILL.md` embedded alongside the manifest at build time (§8) — `internal/build`
+- [ ] Versioned together with the manifest (§36) — the manifest carries `metadata.version`, but the skill has no version field, so a mismatch cannot fail the build yet
+- [x] `--skill` prints it — `internal/runtime`
+- [ ] The daemon serves the skill over IPC — the daemon records only a `Skill bool`; there is no `skill` IPC frame, so MCP cannot yet see the skill text (§29)
+- [x] Skill linter: rejects skills that restate the input schema and requires workflow guidance — `internal/skill/lint.go`
+- [x] `templates/SKILL.md` starting point
 
+**Implemented in:** `internal/skill`, `internal/build` (lint gate), `internal/runtime`.
 **Acceptance:** `github --skill` prints embedded guidance; the daemon returns identical text; a manifest/skill version mismatch fails the build.
+The first clause passes; the last two are open — see the unchecked items above.
 
 ---
 
@@ -173,15 +189,20 @@ raw so `url.Values.Encode` owns query encoding.
 
 **Goal:** expose everything to LLM clients with zero new execution logic.
 
-- [ ] `relay mcp` runs an MCP server (stdio first)
-- [ ] Discovery: registry → tool descriptors → MCP tool list, exposing name, description, and input JSON schema
-- [ ] Naming: `github_get_repository` (or the namespace form when the client supports it, §28)
-- [ ] Invocation: MCP call → the same daemon path as the CLI; no separate engine
-- [ ] Skill exposure to MCP consumers (§29)
-- [ ] Errors use the exact same structured codes as the CLI
-- [ ] Security: MCP inherits the permission and auth path; no MCP-only credential route (§41)
+- [x] `relay mcp` runs an MCP server over stdio; it exits 0 at stdin EOF — `internal/mcp`
+- [x] Discovery: registry → tool descriptors → MCP tool list, exposing name, description, and input JSON schema
+- [x] Naming: `github_get_repository` (the flat `<tool>_<operation>` form, §28)
+- [x] Invocation: MCP call → the same daemon path as the CLI; no separate engine
+- [ ] Skill exposure to MCP consumers (§29) — blocked on the same missing `skill` IPC frame as M5; the daemon serves no skill text yet
+- [x] Errors use the exact same structured codes as the CLI — a missing credential returns `AUTH_REQUIRED` through both paths
+- [x] Security: MCP inherits the permission and auth path; no MCP-only credential route (§41)
+
+**Implemented in:** `internal/mcp`, wired by `cmd/relay`.
+
+**Verified by hand:** `initialize` returns `protocolVersion` `2025-03-26`; `tools/list` includes `github_get_repository` with its `inputSchema`; a `tools/call` with no stored credential returns `result.isError: true` whose `content[0].text` carries the same `AUTH_REQUIRED` code the CLI reports; the server exits cleanly on stdin EOF.
 
 **Acceptance (§60):** the same capability returns the same result through CLI and MCP; a parity test asserts `CLI definition == MCP definition`.
+The parity assertions land in e2e section 11 (M8); the skill half stays open with §29 above.
 
 ---
 
@@ -189,10 +210,10 @@ raw so `url.Values.Encode` owns query encoding.
 
 **Goal:** zero-friction install and use.
 
-- [ ] `relay build | install | list | inspect | daemon | logs | mcp | auth | version`
-- [ ] Tools live under `~/.relay/tools/`; optional `~/.relay/bin` on `PATH`
-- [ ] `relay daemon install` writes `~/Library/LaunchAgents/com.relay.daemon.plist`; auto-start at login (§39)
-- [ ] `relay daemon start|stop|restart|status`; logs to `~/.relay/logs/`
+- [x] `relay build | install | list | inspect | daemon | logs | mcp | auth | stats | version` — every command in the spec's list exists, plus `stats`; there is no `uninstall`
+- [x] Tools live under `~/.relay/tools/`; `~/.relay/bin` is linked on install (§38)
+- [x] `relay daemon install` writes `~/Library/LaunchAgents/com.relay.daemon.plist` and prints the matching `launchctl load` line; it does not load the agent for you (§39)
+- [x] `relay daemon start|stop|restart|status`; logs to `~/.relay/logs/`
 - [ ] `brew` formula (packaging, post-MVP)
 
 **Acceptance:** on a fresh Mac, install relay → the daemon auto-starts → `relay install ./github` → `github ...` works from any directory.
@@ -203,14 +224,14 @@ raw so `url.Values.Encode` owns query encoding.
 
 **Goal:** prove the core loop and lock it with tests.
 
-- [ ] Unit — manifest: required fields, duplicate operations, invalid protocol, invalid auth
-- [ ] Unit — runtime: CLI parsing, input validation, JSON output, exit codes
-- [ ] Unit — daemon: registration, invocation, IPC, registry, errors
-- [ ] Unit — protocol: REST against `httptest`
-- [ ] Security: unauthorized tool access, missing credentials, permission violations, credential leakage, MCP permission bypass
-- [ ] E2E script (§60): build → `--describe` → install → invoke → `--skill` → MCP discovery → MCP invoke → assert CLI/MCP parity
+- [x] Unit — manifest: required fields, duplicate operations, invalid protocol, invalid auth — `internal/manifest/validate_test.go`, `internal/manifest/input_test.go`
+- [ ] Unit — runtime: CLI parsing, input validation, JSON output, exit codes — `internal/runtime` has no test file yet; `parseInput` and the exit-code mapping are untested
+- [x] Unit — daemon: registration, invocation, IPC, registry, errors — `internal/daemon`, `internal/registry`
+- [x] Unit — protocol: REST against `httptest` — `internal/protocol/rest/rest_test.go`
+- [x] Security: unauthorized tool access, missing credentials, permission violations, credential leakage, MCP permission bypass — `internal/keychain/security_test.go`, `internal/daemon/security_test.go`, `internal/mcp/security_test.go`
+- [x] E2E script (§60): build → `--describe` → install → invoke → `--skill` → MCP discovery → MCP invoke → assert CLI/MCP parity — `scripts/e2e.sh`
 - [x] Emit a local usage event on each invocation (§31)
-- [ ] `make e2e` runs in CI
+- [x] `make e2e` runs in CI — `.github/workflows/ci.yml` runs `bash scripts/e2e.sh` on push and pull request
 
 **Acceptance (§61):** the 10-step Definition of Done below passes on a clean machine.
 
@@ -257,7 +278,7 @@ request input value finds nothing.
 
 ## M10 — Additional protocols  (§19, §23, §44, §45, §46, §58)
 
-- [ ] `GraphQLExecutor` (`protocol.type: graphql`) — query and variables from the manifest; CLI and MCP unchanged
+- [x] `GraphQLExecutor` (`protocol.type: graphql`) — query and variables from the manifest; CLI and MCP unchanged — `internal/protocol/graphql`
 - [ ] `GRPCExecutor` (`protocol.type: grpc`) — service and method from the manifest; reflection or bundled descriptors
 - [ ] `LocalExecutor` — filesystem, git, docker, kubectl, ssh, clipboard, notifications, calendar (§46)
 - [ ] `BrowserExecutor` (§23) — shared login, cookies, sessions, OAuth, web interaction
@@ -266,9 +287,9 @@ request input value finds nothing.
 
 ## M11 — Security, permissions, distribution  (§24, §25, §40, §41, §47, §48, §49)
 
-- [ ] Capability declarations: `network`, `keychain`, `browser`, `filesystem.read`, `filesystem.write`, `shell`, `notifications`, `clipboard`
-- [ ] Permission policy: host allowlists, filesystem scopes; a tool asking for a new capability is not silently granted it
-- [ ] Confirmation policy for destructive operations (`delete_repository`, `send_message`, `charge_customer`) with CLI and MCP parity
+- [x] Capability declarations: `network`, `keychain`, `browser`, `filesystem.read`, `filesystem.write`, `shell`, `notifications`, `clipboard` — `internal/permissions`
+- [x] Permission policy: host allowlists, filesystem scopes; a tool asking for a new capability is not silently granted it — `internal/permissions/policy.go`, enforced in `internal/daemon/permissions.go`
+- [x] Confirmation policy for destructive operations (`delete_repository`, `send_message`, `charge_customer`) with CLI and MCP parity — `CodeConfirmationRequired` → `PERMISSION_DENIED` on both paths
 - [ ] Signed tools: verify publisher, signature, binary, and manifest at install (§48)
 - [ ] Trust levels: trusted / verified / unknown / blocked (§49)
 - [ ] Hosted registry, `relay search`, `relay install <name>` (§47)
