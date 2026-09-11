@@ -1,9 +1,10 @@
 // Package protocol defines the execution seam between the daemon and whatever
 // an external service actually speaks.
 //
-// REST is the first implementation, but nothing above this package may assume
-// REST. The CLI, MCP adapter, and registry all deal in Relay operations; the
-// manifest's `protocol.type` selects an Executor, and the protocol stays an
+// REST, GraphQL, gRPC, browser, and local each have an Executor behind this
+// seam, but nothing above this package may assume any one of them. The CLI,
+// MCP adapter, and registry all deal in Relay operations; the manifest's
+// `protocol.type` selects an Executor, and the protocol stays an
 // implementation detail (spec §19).
 package protocol
 
@@ -12,7 +13,7 @@ import "context"
 // Executor runs a resolved Relay operation against a backend.
 //
 // Implementations: RESTExecutor, GraphQLExecutor, GRPCExecutor,
-// BrowserExecutor, LocalExecutor. Only REST is planned for the MVP.
+// BrowserExecutor, LocalExecutor.
 type Executor interface {
 	Execute(ctx context.Context, req Request) (Response, error)
 }

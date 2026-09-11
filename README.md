@@ -192,11 +192,11 @@ relay/
 │   ├── ipc/            # Unix-socket framing
 │   ├── auth/           # credential resolution
 │   ├── keychain/       # macOS Keychain integration
-│   ├── browser/        # shared sessions / browser automation (stub)
+│   ├── browser/        # sessions, login, cookies (form/header; no JS/DOM engine)
 │   ├── protocol/       # the Executor seam
 │   │   ├── rest/       # REST executor (implemented)
 │   │   ├── graphql/    # GraphQL executor (implemented)
-│   │   └── grpc/       # stub
+│   │   └── grpc/       # gRPC executor (implemented)
 │   ├── mcp/            # MCP adapter over the same execution path
 │   ├── telemetry/      # local, privacy-first usage events
 │   ├── permissions/    # capability + permission classification and policy
@@ -233,7 +233,7 @@ one binary:
   [`examples/slack/`](examples/slack/slack.yaml) for a REST service with real
   input schemas and authentication.
 - See [`examples/filesystem/`](examples/filesystem/filesystem.yaml) for the
-  local-capability shape (a non-REST tool; not yet executable).
+  local-capability shape (a non-REST tool; executed by the local executor).
 
 The split is the whole point: the **manifest is machine truth** and answers
 *what operations exist and what inputs they require*; the **skill is LLM
@@ -252,8 +252,8 @@ truth drift (spec §7, §30). The manifest and its skill are versioned together
 
 The core loop works end to end: build a tool, inspect it, run the daemon,
 install the tool, and execute the same capability through the CLI and through
-MCP. REST and GraphQL have executors wired into the daemon; gRPC, browser, and
-local capabilities are planned (see [TASKS.md](TASKS.md) and spec §23, §45–§46).
+MCP. REST, GraphQL, gRPC, browser, and local capabilities all have executors
+wired into the daemon (see [TASKS.md](TASKS.md) and spec §23, §45–§46).
 Credentials live in the macOS Keychain and are managed with `relay auth`;
 `relay stats` reads the local telemetry stream. The `permissions` package
 classifies capability and permission decisions, and the daemon enforces them
