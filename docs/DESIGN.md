@@ -1111,6 +1111,16 @@ Protocol adapter
 
 MCP should not implement a separate execution engine.
 
+Pagination crosses the same seam. When an operation's manifest declares a
+`pagination:` strategy (spec 20), MCP advertises one extra, optional boolean
+argument, `paginate`, alongside the operation's own properties; it is never
+required and it is absent from every operation that cannot paginate. Setting it
+forwards `InvokeRequest.Paginate` to the daemon exactly as
+`relay run --paginate` does, so MCP gains the walk without an execution engine
+of its own. The walk's shape (— the page count and whether the walk was
+truncated —) is reported inside the tool result, never as a stray stdout line,
+so a bounded walk is never mistaken for a complete collection.
+
 ⸻
 
 28. MCP Tool Naming
@@ -1155,6 +1165,14 @@ Instead:
               Capability Model
                  /       \
                CLI       MCP
+
+Pagination is one projection of that shared model, not a place where the two
+definitions diverge. The manifest still declares the only input schema; MCP
+derives its advertised schema from it and adds the reserved `paginate` argument
+solely on operations that declare a `pagination:` strategy. There is no
+MCP-only schema and no MCP-only pagination surface: `paginate` is the adapter's
+name for the same walk opt-in the CLI spells `--paginate`, and both reach the
+daemon as `InvokeRequest.Paginate`.
 
 ⸻
 

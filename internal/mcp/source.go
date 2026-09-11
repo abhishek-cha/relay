@@ -210,6 +210,7 @@ func descriptorsFor(toolName string, doc *manifest.Document) []ToolDescriptor {
 			OperationName: operation.Name,
 			Description:   operation.Description,
 			InputSchema:   inputSchemaMap(operation.Input),
+			Paginated:     operation.Request.Pagination != nil,
 		})
 	}
 	return descriptors
@@ -258,8 +259,19 @@ type DaemonInvoker struct {
 // the CLI reports, so a missing daemon surfaces as a tool error rather than
 // crashing the MCP server (spec §26, §29).
 func (d DaemonInvoker) Invoke(ctx context.Context, tool, operation string, input map[string]any) (any, *relay.Error) {
+	invocation, appErr := d.InvokePaginated(ctx, tool, operation, input, false)
+	return invocation.Result, appErr
+}
+
+// InvokePaginated implements PaginatingInvoker. It is Invoke plus the daemon's
+// pagination opt-in: the reserved MCP argument travels as
+// relay.InvokeRequest.Paginate, and the daemon's Pages/Truncated come back in
+// the returned Invocation (spec §20). Keeping this as an optional extension of
+// Invoker, rather than widening Invoker itself, is what lets every existing
+// Invoker and its tests keep compiling unchanged.
+func (d DaemonInvoker) InvokePaginated(ctx context.Context, tool, operation string, input map[string]any, paginate bool) (Invocation, *relay.Error) {
 	if d.Operations == nil {
-		return nil, relay.NewError(relay.CodeNetworkError,
+		return Invocation{}, relay.NewError(relay.CodeNetworkError,
 			"the Relay daemon is not available; start it with 'relay daemon start'")
 	}
 	if input == nil {
@@ -271,21 +283,26 @@ func (d DaemonInvoker) Invoke(ctx context.Context, tool, operation string, input
 		Tool:      tool,
 		Operation: operation,
 		Input:     input,
+		Paginate:  paginate,
 	})
 	if err != nil {
 		var structured *relay.Error
 		if errors.As(err, &structured) {
-			return nil, structured
+			return Invocation{}, structured
 		}
-		return nil, relay.NewError(relay.CodeNetworkError, err.Error())
+		return Invocation{}, relay.NewError(relay.CodeNetworkError, err.Error())
 	}
 	if !response.Success || response.Error != nil {
 		if response.Error == nil {
-			return nil, relay.NewError(relay.CodeRemoteError, "operation failed")
+			return Invocation{}, relay.NewError(relay.CodeRemoteError, "operation failed")
 		}
-		return nil, response.Error
+		return Invocation{}, response.Error
 	}
-	return response.Result, nil
+	return Invocation{
+		Result:    response.Result,
+		Pages:     response.Pages,
+		Truncated: response.Truncated,
+	}, nil
 }
 
 // New builds the production MCP server: discovery from the registry plus each

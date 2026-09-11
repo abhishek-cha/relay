@@ -82,6 +82,10 @@ type ToolDescriptor struct {
 	// InputSchema is the operation's JSON Schema, copied verbatim from the
 	// manifest so MCP advertises exactly what the CLI accepts.
 	InputSchema map[string]any
+	// Paginated reports whether the operation's manifest declares a pagination
+	// strategy (spec §20). It is what lets tools/list advertise the reserved
+	// PaginateArg argument on exactly the operations that can act on it.
+	Paginated bool
 }
 
 // DescriptorSource provides the MCP tool catalog. Each tool is described with
@@ -100,6 +104,40 @@ type DescriptorSource interface {
 // protocol-level fault.
 type Invoker interface {
 	Invoke(ctx context.Context, tool, operation string, input map[string]any) (any, *relay.Error)
+}
+
+// PaginateArg is the reserved MCP argument that opts a call into a paginated
+// walk (spec §20). tools/list advertises it, as an optional boolean, only on
+// operations whose manifest declares a pagination strategy, and the adapter
+// consumes it as the walk opt-in rather than forwarding it as operation input.
+//
+// Precedence: the name is reserved only on a paginating operation. There the
+// reserved meaning wins, so a manifest that also declared an input property
+// literally named "paginate" cannot have that input set through MCP — the value
+// is the walk opt-in and is stripped before the operation's input is validated.
+// On an operation with no declared pagination the name is not reserved, the
+// argument is not advertised, and a declared "paginate" input keeps its normal
+// meaning. TestPaginateReservedNamePrecedence pins both halves.
+const PaginateArg = "paginate"
+
+// Invocation is one tool result plus the walk shape a paginated call reports
+// (spec §20). Result is the machine result the CLI would print on stdout; Pages
+// and Truncated are zero for an ordinary single-request call and are populated
+// only when the caller opted into pagination, so a bounded walk is never
+// mistaken for a complete collection.
+type Invocation struct {
+	Result    any
+	Pages     int
+	Truncated bool
+}
+
+// PaginatingInvoker is the optional extension of Invoker that carries the
+// pagination opt-in. The adapter type-asserts for it instead of widening
+// Invoker: the four-argument Invoke stays the compatibility contract, so every
+// existing Invoker and its tests keep compiling, while a server whose daemon can
+// walk pages advertises the reserved argument and forwards it (spec §27, §41).
+type PaginatingInvoker interface {
+	InvokePaginated(ctx context.Context, tool, operation string, input map[string]any, paginate bool) (Invocation, *relay.Error)
 }
 
 // ServerInfo identifies this MCP server to clients during the initialize
@@ -236,6 +274,7 @@ func (s *Server) handleToolsList(ctx context.Context, msg *rpcRequest, w io.Writ
 			// declared input still accepts an empty object.
 			schema = map[string]any{"type": "object"}
 		}
+		schema = advertisedSchema(schema, t.Paginated)
 		mcpTools = append(mcpTools, map[string]any{
 			"name":        t.MCPName,
 			"description": t.Description,
@@ -244,6 +283,35 @@ func (s *Server) handleToolsList(ctx context.Context, msg *rpcRequest, w io.Writ
 	}
 
 	s.sendResult(w, msg.ID, map[string]any{"tools": mcpTools})
+}
+
+// advertisedSchema returns the schema tools/list advertises for one operation.
+// It is the manifest's schema verbatim except that a paginating operation gains
+// one reserved, optional boolean property, PaginateArg. The manifest's own
+// properties, and its required list, are copied through untouched, so the
+// manifest stays the single source of truth and the CLI and MCP definitions
+// cannot diverge (spec §7, §29). PaginateArg is never added to required: a walk
+// is opt-in, so the default stays a single page.
+func advertisedSchema(schema map[string]any, paginated bool) map[string]any {
+	if !paginated {
+		return schema
+	}
+	out := make(map[string]any, len(schema)+1)
+	for key, value := range schema {
+		out[key] = value
+	}
+	properties := make(map[string]any)
+	if declared, ok := schema["properties"].(map[string]any); ok {
+		for key, value := range declared {
+			properties[key] = value
+		}
+	}
+	properties[PaginateArg] = map[string]any{
+		"type":        "boolean",
+		"description": "Follow the operation's declared pagination and return the whole collection (opt-in; the default is a single page).",
+	}
+	out["properties"] = properties
+	return out
 }
 
 // handleToolsCall resolves the tool and invokes it through the same daemon path
@@ -270,7 +338,7 @@ func (s *Server) handleToolsCall(ctx context.Context, msg *rpcRequest, w io.Writ
 		return
 	}
 
-	toolName, opName, err := s.resolveTool(ctx, params.Name)
+	desc, err := s.resolveDescriptor(ctx, params.Name)
 	if err != nil {
 		s.sendToolError(w, msg.ID, relay.NewError(relay.CodeToolNotFound, err.Error()))
 		return
@@ -281,25 +349,72 @@ func (s *Server) handleToolsCall(ctx context.Context, msg *rpcRequest, w io.Writ
 		input = map[string]any{}
 	}
 
-	result, appErr := s.Invoker.Invoke(ctx, toolName, opName, input)
+	// PaginateArg is reserved only on an operation that declares pagination. On
+	// such an operation it is the walk opt-in, so it is read here and stripped
+	// before the daemon validates the operation input; it must never be forwarded
+	// as an ordinary argument.
+	paginate := false
+	if desc.Paginated {
+		if raw, present := input[PaginateArg]; present {
+			flag, ok := raw.(bool)
+			if !ok {
+				s.sendToolError(w, msg.ID, relay.NewError(relay.CodeInvalidInput,
+					fmt.Sprintf("%s must be a boolean", PaginateArg)))
+				return
+			}
+			paginate = flag
+		}
+		delete(input, PaginateArg)
+	}
+
+	invocation, appErr := s.invokeTool(ctx, desc, input, paginate)
 	if appErr != nil {
 		s.sendToolError(w, msg.ID, appErr)
 		return
 	}
 
-	payload, err := json.Marshal(result)
+	payload, err := json.Marshal(invocation.Result)
 	if err != nil {
 		s.sendToolError(w, msg.ID, relay.NewError(relay.CodeRemoteError,
 			"failed to encode result: "+err.Error()))
 		return
 	}
 
-	s.sendResult(w, msg.ID, map[string]any{
+	result := map[string]any{
 		"content": []map[string]any{
 			{"type": "text", "text": string(payload)},
 		},
 		"isError": false,
-	})
+	}
+	if paginate {
+		// Report the walk's shape inside the tool result, never as a stray stdout
+		// line: stdout carries protocol frames only (spec §10), and a caller must
+		// be able to tell a bounded walk from a complete collection (spec §20).
+		result["pages"] = invocation.Pages
+		result["truncated"] = invocation.Truncated
+	}
+
+	s.sendResult(w, msg.ID, result)
+}
+
+// invokeTool runs one resolved operation through the invoker. It prefers the
+// optional PaginatingInvoker extension, so the walk opt-in reaches the daemon;
+// an invoker that cannot carry it still serves ordinary calls unchanged. A
+// caller that asked for a walk the invoker cannot perform is refused rather
+// than handed a single page that would look complete (spec §20).
+func (s *Server) invokeTool(ctx context.Context, desc ToolDescriptor, input map[string]any, paginate bool) (Invocation, *relay.Error) {
+	if invoker, ok := s.Invoker.(PaginatingInvoker); ok {
+		return invoker.InvokePaginated(ctx, desc.ToolName, desc.OperationName, input, paginate)
+	}
+	if paginate {
+		return Invocation{}, relay.NewError(relay.CodeInvalidInput,
+			"this server's invoker cannot paginate")
+	}
+	result, appErr := s.Invoker.Invoke(ctx, desc.ToolName, desc.OperationName, input)
+	if appErr != nil {
+		return Invocation{}, appErr
+	}
+	return Invocation{Result: result}, nil
 }
 
 // handlePing answers the liveness probe with an empty result.
@@ -328,20 +443,21 @@ func (s *Server) loadDescriptors(ctx context.Context) ([]ToolDescriptor, error) 
 	return tools, nil
 }
 
-// resolveTool maps an MCP tool name back to its tool + operation pair by
-// matching the cached descriptor catalog, which was itself derived from the
-// binary's manifest.
-func (s *Server) resolveTool(ctx context.Context, mcpName string) (toolName, opName string, err error) {
+// resolveDescriptor maps an MCP tool name back to the descriptor it was
+// advertised from, matching the cached catalog, which was itself derived from
+// the binary's manifest. The descriptor carries the operation's pagination flag
+// so the call path knows whether PaginateArg is reserved.
+func (s *Server) resolveDescriptor(ctx context.Context, mcpName string) (ToolDescriptor, error) {
 	tools, err := s.loadDescriptors(ctx)
 	if err != nil {
-		return "", "", err
+		return ToolDescriptor{}, err
 	}
 	for _, t := range tools {
 		if t.MCPName == mcpName {
-			return t.ToolName, t.OperationName, nil
+			return t, nil
 		}
 	}
-	return "", "", fmt.Errorf("unknown tool: %s", mcpName)
+	return ToolDescriptor{}, fmt.Errorf("unknown tool: %s", mcpName)
 }
 
 // sendResult writes a successful JSON-RPC response.

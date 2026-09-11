@@ -832,6 +832,115 @@ check "list_pages --paginate reports the walk on stderr" "ok" "$(grep -q 'collec
 check "list_pages --paginate stdout is still pure JSON" "ok" "$(python3 -c 'import json,sys; json.load(open(sys.argv[1])); print("ok")' "$paged_out" 2>&1)"
 check "list_pages --paginate never mixes a diagnostic into stdout" "ok" "$(grep -q 'collected\|relay:' "$paged_out" && echo bad || echo ok)"
 
+# --- 16b. MCP pagination parity (spec §20, §27, §29) ---
+#
+# The CLI gained --paginate; MCP must not be a second execution model that
+# silently disagrees. The paginating operation advertises one reserved, optional
+# boolean argument, tools/call threads it to the daemon as InvokeRequest.Paginate,
+# and the walk's shape (pages, truncated) rides back inside the tool result. The
+# same operation through MCP and through `relay run --paginate` must produce the
+# same machine result.
+echo "    MCP pagination parity (spec §20, §27, §29)"
+
+mcp_pag_frames="$workdir/mcp.paginate.frames.jsonl"
+cat > "$mcp_pag_frames" <<'JSONL'
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"relay-e2e","version":"0.0.0"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+{"jsonrpc":"2.0","id":2,"method":"tools/list"}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"pagedemo_list_pages","arguments":{"paginate":true}}}
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"pagedemo_list_pages","arguments":{}}}
+JSONL
+
+before=$(wc -l < "$sportlog" | tr -d ' ')
+mcp_pag_out="$workdir/mcp.paginate.out.jsonl"
+mcp_pag_err="$workdir/mcp.paginate.err"
+"$workdir/relay" mcp < "$mcp_pag_frames" > "$mcp_pag_out" 2> "$mcp_pag_err"
+check "relay mcp paginated run exits 0 at stdin EOF" "0" "$?"
+check "relay mcp paginated run keeps stderr empty" "0" "$(wc -c < "$mcp_pag_err" | tr -d ' ')"
+
+check "MCP advertises paginate only on the paginating operation" "ok" "$(python3 - "$mcp_pag_out" <<'PY'
+import json, sys
+frames = {}
+for line in open(sys.argv[1]):
+    if line.strip():
+        frame = json.loads(line)
+        frames[frame.get("id")] = frame
+tools = {t.get("name"): t for t in frames.get(2, {}).get("result", {}).get("tools", [])}
+paged = (tools.get("pagedemo_list_pages", {}).get("inputSchema") or {})
+plain = (tools.get("github_get_repository", {}).get("inputSchema") or {})
+paged_props = paged.get("properties") or {}
+problems = []
+if paged_props.get("paginate", {}).get("type") != "boolean":
+    problems.append("paginate=%r" % paged_props.get("paginate"))
+if "paginate" in (paged.get("required") or []):
+    problems.append("paginate is required")
+if "paginate" in (plain.get("properties") or {}):
+    problems.append("paginate leaked to a non-paginated operation")
+print("ok" if not problems else "bad:" + ";".join(problems))
+PY
+)"
+
+check "MCP paginated call matches the CLI result and reports the walk" "ok" "$(python3 - "$mcp_pag_out" "$paged_out" <<'PY'
+import json, sys
+frames = {}
+for line in open(sys.argv[1]):
+    if line.strip():
+        frame = json.loads(line)
+        frames[frame.get("id")] = frame
+result = frames.get(3, {}).get("result", {})
+content = json.loads(result.get("content", [{}])[0].get("text", "null"))
+cli = json.load(open(sys.argv[2]))
+problems = []
+if result.get("isError") is not False:
+    problems.append("isError=%r" % result.get("isError"))
+if content != cli:
+    problems.append("content=%r cli=%r" % (content, cli))
+if result.get("pages") != 3:
+    problems.append("pages=%r" % result.get("pages"))
+if result.get("truncated") is not False:
+    problems.append("truncated=%r" % result.get("truncated"))
+print("ok" if not problems else "bad:" + ";".join(problems))
+PY
+)"
+
+check "MCP call without paginate stays single-page" "ok" "$(python3 - "$mcp_pag_out" <<'PY'
+import json, sys
+frames = {}
+for line in open(sys.argv[1]):
+    if line.strip():
+        frame = json.loads(line)
+        frames[frame.get("id")] = frame
+result = frames.get(4, {}).get("result", {})
+content = json.loads(result.get("content", [{}])[0].get("text", "null"))
+problems = []
+if content != {"items": ["a", "b"]}:
+    problems.append("content=%r" % (content,))
+if "pages" in result or "truncated" in result:
+    problems.append("walk shape leaked into a single-page result")
+print("ok" if not problems else "bad:" + ";".join(problems))
+PY
+)"
+
+check "MCP walk plus default call make four requests through the daemon" "4" "$(( $(wc -l < "$sportlog" | tr -d ' ') - before ))"
+check "MCP paginated call then the single-page call hit the server in order" \
+    "GET /pages|GET /pages?page=2|GET /pages?page=3|GET /pages|" "$(tail -n 4 "$sportlog" | tr '\n' '|')"
+check "MCP paginated stdout carries protocol frames only" "ok" "$(python3 - "$mcp_pag_out" <<'PY'
+import json, sys
+problems = []
+for lineno, line in enumerate(open(sys.argv[1]), 1):
+    if not line.strip():
+        continue
+    try:
+        frame = json.loads(line)
+    except Exception as exc:
+        problems.append("line %d: %s" % (lineno, exc))
+        continue
+    if frame.get("jsonrpc") != "2.0":
+        problems.append("line %d is not JSON-RPC 2.0" % lineno)
+print("ok" if not problems else "bad:" + ";".join(problems))
+PY
+)"
+
 # --- 17. browser session verbs and an end-to-end session (spec §23) ---
 #
 # session_login runs a tool's declared login and stores the cookie; a later
