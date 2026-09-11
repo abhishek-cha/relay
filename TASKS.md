@@ -209,7 +209,7 @@ raw so `url.Values.Encode` owns query encoding.
 - [ ] Unit — protocol: REST against `httptest`
 - [ ] Security: unauthorized tool access, missing credentials, permission violations, credential leakage, MCP permission bypass
 - [ ] E2E script (§60): build → `--describe` → install → invoke → `--skill` → MCP discovery → MCP invoke → assert CLI/MCP parity
-- [ ] Emit a local usage event on each invocation (§31)
+- [x] Emit a local usage event on each invocation (§31)
 - [ ] `make e2e` runs in CI
 
 **Acceptance (§61):** the 10-step Definition of Done below passes on a clean machine.
@@ -224,11 +224,34 @@ Everything above is the first release (§51). Everything below is post-MVP.
 
 ## M9 — Telemetry  (§31, §32, §33, §57)
 
-- [ ] Local, aggregated events under `~/.relay/telemetry/`: tool, operation, timestamp, durationMs, success
-- [ ] Never collect tokens, keys, request bodies, responses, or personal data
-- [ ] Per-tool summaries: operation frequency, sequences, failure rate, latency, rate limits
+- [x] Local, aggregated events under `~/.relay/telemetry/`: tool, operation, timestamp, durationMs, success
+- [x] Never collect tokens, keys, request bodies, responses, or personal data
+- [x] Per-tool summaries: operation frequency, sequences, failure rate, latency, rate limits
 - [ ] Sequence mining → skill suggestions; proposals are reviewed, never auto-applied
-- [ ] Optional anonymous opt-in
+      Sequences are mined and rendered by `relay stats`, but Relay does not yet
+      draft a skill edit. The events a suggestion would be built from are already
+      recorded, so this is purely additive.
+- [ ] Optional anonymous opt-in — deliberately absent: telemetry is local only and
+      there is no network path to opt into (spec §32).
+
+**Implemented in:** `internal/telemetry` (recorder + summary), wired into the daemon
+at `internal/daemon/telemetry.go` and surfaced by `relay stats`.
+
+**Decisions taken:**
+
+- **Telemetry is on by default and local.** The value comes from seeing how
+  capabilities are really used, and the data never leaves the machine, so the
+  daemon records by default and `relayd --no-telemetry` turns it off.
+- **The event surface is the privacy guarantee.** `telemetry.Event` has no field
+  for inputs, headers, bodies, or responses, so a secret cannot be recorded by
+  accident. `TestUsageEventCarriesNoPayload` pins the wire shape so a new field
+  cannot be added silently.
+- **Recording can never fail an invocation.** A telemetry error is discarded, and
+  the e2e suite asserts the on-disk stream contains no request input.
+
+**Acceptance:** `relay stats` renders per-tool frequency, failure rate, latency, and
+observed operation sequences from the local stream; grepping that stream for a
+request input value finds nothing.
 
 ---
 

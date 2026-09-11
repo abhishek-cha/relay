@@ -350,7 +350,44 @@ check "list_repos sends the declared query param" "GET /repos/openai/repos?state
 check "list_repos (without state) exits 0" "0" "$?"
 check "list_repos omits an unsupplied query param" "GET /repos/openai/repos" "$(tail -n 1 "$reqlog")"
 
-# --- 10. after stop: tool reports NETWORK_ERROR, status fails ---
+# --- 10. usage telemetry is local and aggregate (spec §31, §32) ---
+echo "    usage telemetry"
+telem="$RELAY_HOME/telemetry/usage.jsonl"
+check "telemetry stream exists" "yes" "$([ -f "$telem" ] && echo yes || echo no)"
+check "every telemetry line is JSON" "ok" "$(python3 - "$telem" <<'PY'
+import json, sys
+bad = 0
+with open(sys.argv[1]) as fh:
+    for line in fh:
+        if not line.strip():
+            continue
+        try:
+            json.loads(line)
+        except Exception:
+            bad += 1
+print("ok" if bad == 0 else "bad:%d" % bad)
+PY
+)"
+check "telemetry records the demo operations" "ok" "$(python3 - "$telem" <<'PY'
+import json, sys
+seen = set()
+for line in open(sys.argv[1]):
+    if line.strip():
+        event = json.loads(line)
+        if event["tool"] == "demo":
+            seen.add(event["operation"])
+want = {"get_repo", "list_repos"}
+print("ok" if want <= seen else "missing:" + repr(sorted(want - seen)))
+PY
+)"
+# The event surface has no field for input values, so an input like the owner
+# name below must never reach disk (spec §32).
+check "telemetry carries no request input" "clean" "$(grep -q 'openai' "$telem" && echo leak || echo clean)"
+check "relay stats --json counts the invocations" "ok" "$("$workdir/relay" stats --json 2>/dev/null | python3 -c 'import json,sys; t=json.load(sys.stdin)["tools"].get("demo",{}); print("ok" if t.get("total",0) >= 3 and "get_repo" in t.get("operations",{}) else "bad:"+repr(t)[:90])' 2>&1)"
+check "relay stats renders the human view" "ok" "$("$workdir/relay" stats 2>/dev/null | grep -q 'get_repo' && echo ok || echo bad)"
+check "relay stats --tool filters to one tool" "ok" "$("$workdir/relay" stats --tool demo 2>/dev/null | grep -q '^demo' && echo ok || echo bad)"
+
+# --- 11. after stop: tool reports NETWORK_ERROR, status fails ---
 echo "    daemon stop"
 "$workdir/relay" daemon stop >/dev/null 2>&1
 sleep 1
@@ -358,7 +395,7 @@ check "tool after stop gets NETWORK_ERROR" "NETWORK_ERROR" \
     "$("$RELAY_HOME/tools/github" get-repository --owner openai --repo relay 2>&1 >/dev/null | python3 -c 'import sys; print(sys.stdin.read().split(":")[1].strip())')"
 check "status after stop fails" "false" "$("$workdir/relay" daemon status >/dev/null 2>&1 && echo true || echo false)"
 
-# --- 11. re-install is idempotent ---
+# --- 12. re-install is idempotent ---
 echo "    re-install idempotency"
 "$workdir/relay" daemon start >/dev/null 2>&1
 sleep 1

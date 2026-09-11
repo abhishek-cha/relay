@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -26,6 +27,7 @@ import (
 	"relay/internal/mcp"
 	"relay/internal/paths"
 	"relay/internal/registry"
+	"relay/internal/telemetry"
 	"relay/pkg/relay"
 )
 
@@ -49,6 +51,7 @@ Commands:
   logs      Show daemon logs
   mcp       Run the MCP server
   auth      Manage tool credentials
+  stats     Show local usage statistics
   version   Print the Relay version
 
 The manifest and CLI contracts are the product; see docs/DESIGN.md.
@@ -88,6 +91,8 @@ func run(args []string) int {
 		return runMCP(args[1:])
 	case "auth":
 		return runAuth(args[1:])
+	case "stats":
+		return runStats(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "relay: %q is not implemented yet — see TASKS.md\n", args[0])
 		return 2
@@ -683,6 +688,131 @@ func buildPlist(relayd, socket, log, home string) string {
 }
 
 // ─── logs ───────────────────────────────────────────────────────────────────
+
+// runStats renders the local usage summary (spec §31, §57).
+//
+// The summary is computed from the JSONL stream under the Relay home, so it
+// needs no daemon and works while the daemon is stopped, exactly like relay
+// list. Nothing here reaches the network: telemetry stays local (spec §32).
+func runStats(args []string) int {
+	flags := flag.NewFlagSet("relay stats", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	flags.Usage = func() {
+		fmt.Fprint(os.Stderr, "usage: relay stats [--json] [--tool NAME] [--sequences N]\n")
+		flags.PrintDefaults()
+	}
+	asJSON := flags.Bool("json", false, "emit the summary as JSON")
+	tool := flags.String("tool", "", "limit the summary to one tool")
+	seqLen := flags.Int("sequences", telemetry.DefaultSequenceLen, "operation-sequence length to mine")
+	if err := flags.Parse(permute(flags, args)); err != nil {
+		return 2
+	}
+	if flags.NArg() != 0 {
+		flags.Usage()
+		return 2
+	}
+	if *seqLen < 1 {
+		fmt.Fprintln(os.Stderr, "relay: --sequences must be at least 1")
+		return 2
+	}
+
+	layout := paths.Default()
+	fmt.Fprintf(os.Stderr, "relay: %s\n", telemetry.File(layout))
+
+	events, err := readTelemetry(layout)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "relay: %v\n", err)
+		return 1
+	}
+	if len(events) == 0 {
+		fmt.Fprintln(os.Stderr, "relay: no usage recorded yet; run a tool and try again")
+		return 0
+	}
+
+	summary := telemetry.SummarizeN(events, *seqLen)
+	if *tool != "" {
+		stats, known := summary.Tools[*tool]
+		if !known {
+			fmt.Fprintf(os.Stderr, "relay: no usage recorded for %q\n", *tool)
+			return 1
+		}
+		summary = telemetry.Summary{Tools: map[string]telemetry.ToolStats{*tool: stats}}
+	}
+
+	if *asJSON {
+		encoded, err := json.MarshalIndent(summary, "", "  ")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "relay: %v\n", err)
+			return 1
+		}
+		fmt.Println(string(encoded))
+		return 0
+	}
+
+	printSummary(os.Stdout, summary)
+	return 0
+}
+
+// readTelemetry reads the local usage stream, oldest file first so observed
+// sequences stay in order across a rotation. A missing file is not an error: it
+// only means nothing has been recorded yet.
+func readTelemetry(layout paths.Layout) ([]telemetry.Event, error) {
+	var events []telemetry.Event
+	for _, path := range []string{telemetry.Backup(layout), telemetry.File(layout)} {
+		file, err := os.Open(path)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return nil, err
+		}
+		read, readErr := telemetry.ReadEvents(file)
+		file.Close()
+		if readErr != nil {
+			return nil, fmt.Errorf("read %s: %w", path, readErr)
+		}
+		events = append(events, read...)
+	}
+	return events, nil
+}
+
+// printSummary renders the human view: per tool, its operations by frequency
+// with failure count and latency, then the observed sequences. The sequences are
+// the raw material a skill revision would be based on, and they are shown to the
+// operator rather than applied, because a skill change is reviewed, never
+// automatic (spec §31, §33).
+func printSummary(w io.Writer, summary telemetry.Summary) {
+	names := make([]string, 0, len(summary.Tools))
+	for name := range summary.Tools {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	for _, name := range names {
+		stats := summary.Tools[name]
+		fmt.Fprintf(w, "%s  %d call(s), %d failure(s)\n", name, stats.Total, stats.Failures)
+
+		operations := make([]string, 0, len(stats.Operations))
+		for operation := range stats.Operations {
+			operations = append(operations, operation)
+		}
+		sort.Slice(operations, func(i, j int) bool {
+			left, right := stats.Operations[operations[i]], stats.Operations[operations[j]]
+			if left.Count != right.Count {
+				return left.Count > right.Count
+			}
+			return operations[i] < operations[j]
+		})
+		for _, operation := range operations {
+			op := stats.Operations[operation]
+			fmt.Fprintf(w, "  %-28s %4d call(s)  %3d failure(s)  p50 %5dms  p90 %5dms  p99 %5dms\n",
+				operation, op.Count, op.Failures, op.P50Ms, op.P90Ms, op.P99Ms)
+		}
+		for _, sequence := range stats.Sequences {
+			fmt.Fprintf(w, "  sequence (%dx): %s\n", sequence.Count, strings.Join(sequence.Operations, " -> "))
+		}
+	}
+}
 
 // runLogs prints daemon log lines (spec §3.3).
 func runLogs(args []string) int {

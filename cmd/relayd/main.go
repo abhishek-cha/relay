@@ -23,6 +23,7 @@ import (
 	"relay/internal/paths"
 	"relay/internal/protocol"
 	"relay/internal/protocol/rest"
+	"relay/internal/telemetry"
 )
 
 var version = "0.0.0-dev"
@@ -36,6 +37,7 @@ Flags:
   --socket PATH  Unix socket to serve on (default: <relay home>/run/daemon.sock)
   --log PATH     append logs to this file instead of stderr
   --version      print the daemon version and exit
+  --no-telemetry do not record local usage telemetry
 
 The Relay home defaults to ~/.relay and can be redirected with RELAY_HOME.
 
@@ -56,6 +58,7 @@ func run(args []string) int {
 	socket := flags.String("socket", "", "Unix socket to serve on (one daemon per Relay home)")
 	logPath := flags.String("log", "", "append logs to this file instead of stderr")
 	showVersion := flags.Bool("version", false, "print the daemon version and exit")
+	noTelemetry := flags.Bool("no-telemetry", false, "do not record local usage telemetry")
 
 	if err := flags.Parse(args); err != nil {
 		return 2
@@ -70,6 +73,18 @@ func run(args []string) int {
 	}
 
 	layout := paths.Default()
+
+	// Usage telemetry is local and aggregate (spec §31, §32). It is on by
+	// default because the whole point is to observe how capabilities are really
+	// used, and off by a single flag so an operator can refuse it. The recorder
+	// is declared as the interface type: a nil *Recorder stored in a non-nil
+	// interface would silently re-enable recording.
+	var usage daemon.UsageRecorder
+	if !*noTelemetry {
+		recorder := telemetry.New(layout)
+		defer recorder.Close()
+		usage = recorder
+	}
 
 	logDestination, closeLog, err := openLog(*logPath)
 	if err != nil {
@@ -88,10 +103,11 @@ func run(args []string) int {
 	// PROTOCOL_ERROR rather than guessed at, so the rejection stays honest as
 	// new executors land (spec §19).
 	d := daemon.New(daemon.Config{
-		Layout:  layout,
-		Version: version,
-		Socket:  *socket,
-		Log:     logDestination,
+		Layout:    layout,
+		Version:   version,
+		Socket:    *socket,
+		Log:       logDestination,
+		Telemetry: usage,
 		Executors: map[string]protocol.Executor{
 			"rest": rest.New(),
 		},

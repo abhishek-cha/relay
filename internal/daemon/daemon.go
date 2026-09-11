@@ -36,6 +36,11 @@ type Config struct {
 	// macOS Keychain; tests inject a fake Store so the daemon is constructible
 	// without touching the real Keychain.
 	Keychain keychain.Store
+	// Telemetry records one local usage event per invocation (spec §31). A nil
+	// recorder disables telemetry, which is what a directly constructed daemon
+	// and the unit tests want; relayd injects the real one. Recording is
+	// best-effort and can never fail an invocation.
+	Telemetry UsageRecorder
 	// ToolTimeout bounds a tool's discovery reply. Defaults to 10s.
 	ToolTimeout time.Duration
 	// Now is the clock, injectable so uptime and install timestamps are testable.
@@ -53,6 +58,7 @@ type Daemon struct {
 	version     string
 	store       *registry.Store
 	resolver    *auth.Resolver
+	usage       UsageRecorder
 	executors   map[string]protocol.Executor
 	toolTimeout time.Duration
 	now         func() time.Time
@@ -94,6 +100,7 @@ func New(cfg Config) *Daemon {
 		version:     cfg.Version,
 		store:       registry.New(cfg.Layout.Registry),
 		resolver:    auth.New(keychainStore),
+		usage:       cfg.Telemetry,
 		executors:   executors,
 		toolTimeout: timeout,
 		now:         now,
@@ -226,7 +233,7 @@ func (d *Daemon) hello(request relay.HelloRequest) relay.HelloResponse {
 // and compatible, the operation must exist, and the input must validate before
 // any network traffic happens. That way a caller gets a precise error instead of
 // a confusing remote failure (spec §18, §26).
-func (d *Daemon) invoke(ctx context.Context, request relay.InvokeRequest) relay.InvokeResponse {
+func (d *Daemon) invokeOperation(ctx context.Context, request relay.InvokeRequest) relay.InvokeResponse {
 	installation, err := d.store.Get(request.Tool)
 	if err != nil {
 		return invokeFailure(unknownTool(err, request.Tool))
@@ -288,6 +295,19 @@ func (d *Daemon) invoke(ctx context.Context, request relay.InvokeRequest) relay.
 	}
 
 	return relay.InvokeResponse{Success: true, Result: response.Body}
+}
+
+// invoke answers one invocation and records a local usage event for it
+// (spec §31).
+//
+// The event is recorded for failures as well as successes, because the failure
+// rate and the error code are the two things a summary is most useful for: an
+// agent repeatedly hitting AUTH_REQUIRED is a workflow problem worth seeing.
+func (d *Daemon) invoke(ctx context.Context, request relay.InvokeRequest) relay.InvokeResponse {
+	started := d.now()
+	response := d.invokeOperation(ctx, request)
+	d.recordUsage(request, response, d.now().Sub(started))
+	return response
 }
 
 // credential resolves the secret to inject at execution time (spec §21, §22).
