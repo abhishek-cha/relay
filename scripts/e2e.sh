@@ -164,14 +164,20 @@ ok = d.get("name") == "github" and "get_repository" in names and "list_pull_requ
 print("ok" if ok else "bad:name=" + str(d.get("name")) + " tools=" + str(names))
 ' 2>&1)"
 
-# --- 6. registered tool routes through daemon; a protocol with no executor is
-# rejected with PROTOCOL_ERROR ---
+# --- 6. registered tool routes through daemon; a known protocol with no
+# executor is rejected with PROTOCOL_ERROR ---
 #
 # The REST executor is wired into the daemon now, so invoking the example tool
 # would really leave the machine and hit api.github.com.  This asserts the
-# daemon's unimplemented-protocol rejection with a throwaway tool instead: a
-# declared protocol that has no executor yet is rejected rather than guessed at
+# daemon's unimplemented-protocol rejection with a throwaway tool instead
 # (spec §19, §20).  The build/install shape mirrors the 'ghost' block in §8.
+#
+# The fixture declares grpc: a known protocol the validator accepts, but one
+# this build registers no executor for.  That combination is the point -- the
+# manifest must survive validation and install, then fail at dispatch, so the
+# rejection is proven to be the daemon refusing to guess at execution rather
+# than the validator turning the manifest away early.  (grpc stands in here
+# because graphql used to be executor-less and no longer is.)
 echo "    registered tool invocation"
 cat > "$workdir/unimplemented.yaml" <<MANIFEST
 apiVersion: relay/v1
@@ -184,8 +190,8 @@ runtime:
   name: relay
   apiVersion: v1
 protocol:
-  type: graphql
-  endpoint: https://example.invalid/graphql
+  type: grpc
+  endpoint: https://example.invalid/grpc
 tools:
   - name: ping
     description: Never reaches an executor
@@ -196,9 +202,10 @@ tools:
       method: POST
       path: /
 MANIFEST
-"$workdir/relay" build "$workdir/unimplemented.yaml" --out "$workdir/unimplemented" >/dev/null 2>&1
+check "manifest with a known-but-unimplemented protocol validates" "0" \
+    "$("$workdir/relay" build "$workdir/unimplemented.yaml" --out "$workdir/unimplemented" >/dev/null 2>&1; echo $?)"
 "$workdir/relay" install "$workdir/unimplemented" >/dev/null 2>&1
-check "unimplemented protocol gets PROTOCOL_ERROR" "PROTOCOL_ERROR" \
+check "protocol without an executor gets PROTOCOL_ERROR at dispatch" "PROTOCOL_ERROR" \
     "$("$RELAY_HOME/tools/unimplemented" ping 2>&1 >/dev/null | python3 -c 'import sys; print(sys.stdin.read().split(":")[1].strip())')"
 
 # --- 7. second daemon start fails (single-instance) ---
@@ -387,7 +394,157 @@ check "relay stats --json counts the invocations" "ok" "$("$workdir/relay" stats
 check "relay stats renders the human view" "ok" "$("$workdir/relay" stats 2>/dev/null | grep -q 'get_repo' && echo ok || echo bad)"
 check "relay stats --tool filters to one tool" "ok" "$("$workdir/relay" stats --tool demo 2>/dev/null | grep -q '^demo' && echo ok || echo bad)"
 
-# --- 11. after stop: tool reports NETWORK_ERROR, status fails ---
+# --- 11. MCP discovery, invocation, and CLI/MCP parity (spec §27, §28, §29) ---
+#
+# Drives `relay mcp` over stdio the way a real client does: one JSON-RPC frame
+# per line in, one per line out.  The requests live in a file so the frames stay
+# readable, and stdout/stderr are captured separately so a diagnostic on stdout
+# or a protocol frame on stderr fails the run instead of vanishing into a merged
+# stream.  The daemon is up and github is installed, so discovery and invocation
+# exercise the real registry and the real IPC path.
+echo "    MCP discovery, invocation, and parity"
+
+mcp_frames="$workdir/mcp.frames.jsonl"
+cat > "$mcp_frames" <<'JSONL'
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"relay-e2e","version":"0.0.0"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+{"jsonrpc":"2.0","id":2,"method":"tools/list"}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"github_get_repository","arguments":{"owner":"openai","repo":"relay"}}}
+{"jsonrpc":"2.0","id":4,"method":"ping"}
+JSONL
+
+mcp_out="$workdir/mcp.out.jsonl"
+mcp_err="$workdir/mcp.err"
+"$workdir/relay" mcp < "$mcp_frames" > "$mcp_out" 2> "$mcp_err"
+check "relay mcp exits 0 at stdin EOF" "0" "$?"
+check "relay mcp keeps stderr empty" "0" "$(wc -c < "$mcp_err" | tr -d ' ')"
+
+# Responses are keyed by id: the notification is fire-and-forget, so exactly the
+# four id-bearing frames are answered, once each, with no reply to the
+# notification to confuse the client.
+check "answers each id once, stays silent on the notification" "ok" "$(python3 - "$mcp_out" <<'PY'
+import json, sys
+frames, duplicates = {}, []
+for line in open(sys.argv[1]):
+    if not line.strip():
+        continue
+    frame = json.loads(line)
+    if frame.get("id") in frames:
+        duplicates.append(frame.get("id"))
+    frames[frame.get("id")] = frame
+problems = []
+if sorted(frames) != [1, 2, 3, 4]:
+    problems.append("ids=" + repr(sorted(frames)))
+if duplicates:
+    problems.append("duplicate ids=" + repr(duplicates))
+problems += ["jsonrpc on id %s" % i for i, f in frames.items() if f.get("jsonrpc") != "2.0"]
+print("ok" if not problems else "bad:" + ";".join(problems))
+PY
+)"
+
+check "initialize advertises protocolVersion 2025-03-26" "2025-03-26" "$(python3 - "$mcp_out" <<'PY'
+import json, sys
+frames = {}
+for line in open(sys.argv[1]):
+    if line.strip():
+        frame = json.loads(line)
+        frames[frame.get("id")] = frame
+print(frames.get(1, {}).get("result", {}).get("protocolVersion", ""))
+PY
+)"
+
+# Discovery is the binary's own projection: every advertised name is
+# <tool>_<operation> and every one carries the input schema the CLI validates
+# against, so a client can build a call without a second schema source.
+check "tools/list advertises <tool>_<operation> names with schemas" "ok" "$(python3 - "$mcp_out" <<'PY'
+import json, re, sys
+frames = {}
+for line in open(sys.argv[1]):
+    if line.strip():
+        frame = json.loads(line)
+        frames[frame.get("id")] = frame
+tools = frames.get(2, {}).get("result", {}).get("tools", [])
+names = [t.get("name", "") for t in tools]
+problems = []
+if "github_get_repository" not in names or "github_list_pull_requests" not in names:
+    problems.append("github ops missing from " + repr(names))
+for tool in tools:
+    if not re.match(r"^[A-Za-z0-9_-]+_[A-Za-z0-9_]+$", tool.get("name", "")):
+        problems.append("unqualified name " + repr(tool.get("name")))
+    if not isinstance(tool.get("inputSchema"), dict):
+        problems.append("no inputSchema for " + repr(tool.get("name")))
+print("ok" if not problems else "bad:" + ";".join(problems))
+PY
+)"
+
+# A call with no stored credential must return the structured relay error inside
+# the tool result rather than a JSON-RPC protocol fault, so the client branches
+# on a code instead of treating a missing credential as a broken server.
+check "tools/call with no credential is a tool error, not a protocol fault" "ok" "$(python3 - "$mcp_out" <<'PY'
+import json, sys
+frames = {}
+for line in open(sys.argv[1]):
+    if line.strip():
+        frame = json.loads(line)
+        frames[frame.get("id")] = frame
+call = frames.get(3, {})
+result = call.get("result", {})
+content = result.get("content") or [{}]
+problems = []
+if "error" in call:
+    problems.append("protocol fault " + repr(call["error"]))
+if result.get("isError") is not True:
+    problems.append("isError=" + repr(result.get("isError")))
+if content[0].get("type") != "text":
+    problems.append("content=" + repr(content)[:80])
+print("ok" if not problems else "bad:" + ";".join(problems))
+PY
+)"
+
+check "MCP error payload is AUTH_REQUIRED with a login hint" "ok" "$(python3 - "$mcp_out" <<'PY'
+import json, sys
+frames = {}
+for line in open(sys.argv[1]):
+    if line.strip():
+        frame = json.loads(line)
+        frames[frame.get("id")] = frame
+text = frames.get(3, {}).get("result", {}).get("content", [{}])[0].get("text", "")
+err = json.loads(text)
+problems = []
+if err.get("code") != "AUTH_REQUIRED":
+    problems.append("code=" + repr(err.get("code")))
+if "relay auth login github" not in err.get("message", ""):
+    problems.append("message=" + repr(err.get("message")))
+if err.get("retryable") is not False:
+    problems.append("retryable=" + repr(err.get("retryable")))
+print("ok" if not problems else "bad:" + ";".join(problems))
+PY
+)"
+
+# Parity is on the code, not the prose.  The CLI here is the installed binary, so
+# the comparison crosses the same daemon hop instead of a second route.
+github_cli="$RELAY_HOME/tools/github"
+github_err="$workdir/mcp.cli.err"
+"$github_cli" get-repository --owner openai --repo relay >/dev/null 2> "$github_err"
+check "CLI reports github: AUTH_REQUIRED: on stderr" "ok" "$(grep -q '^github: AUTH_REQUIRED:' "$github_err" && echo ok || echo bad)"
+check "MCP and CLI report the same error code" "ok" "$(python3 - "$mcp_out" "$github_err" <<'PY'
+import json, sys
+frames = {}
+for line in open(sys.argv[1]):
+    if line.strip():
+        frame = json.loads(line)
+        frames[frame.get("id")] = frame
+mcp_code = json.loads(frames[3]["result"]["content"][0]["text"])["code"]
+cli_code = ""
+for line in open(sys.argv[2]):
+    if line.startswith("github: "):
+        cli_code = line.split(": ", 2)[1]
+        break
+print("ok" if mcp_code == cli_code and cli_code else "bad:mcp=%s cli=%s" % (mcp_code, cli_code))
+PY
+)"
+
+# --- 12. after stop: tool reports NETWORK_ERROR, status fails ---
 echo "    daemon stop"
 "$workdir/relay" daemon stop >/dev/null 2>&1
 sleep 1
@@ -395,7 +552,7 @@ check "tool after stop gets NETWORK_ERROR" "NETWORK_ERROR" \
     "$("$RELAY_HOME/tools/github" get-repository --owner openai --repo relay 2>&1 >/dev/null | python3 -c 'import sys; print(sys.stdin.read().split(":")[1].strip())')"
 check "status after stop fails" "false" "$("$workdir/relay" daemon status >/dev/null 2>&1 && echo true || echo false)"
 
-# --- 12. re-install is idempotent ---
+# --- 13. re-install is idempotent ---
 echo "    re-install idempotency"
 "$workdir/relay" daemon start >/dev/null 2>&1
 sleep 1
