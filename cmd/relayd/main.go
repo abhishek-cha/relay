@@ -21,6 +21,8 @@ import (
 	"relay/internal/ipc"
 	"relay/internal/manifest"
 	"relay/internal/paths"
+	"relay/internal/protocol"
+	"relay/internal/protocol/rest"
 )
 
 var version = "0.0.0-dev"
@@ -81,14 +83,18 @@ func run(args []string) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Executors are wired in with TASKS.md milestone M3 (REST). Until a protocol
-	// has an executor the daemon rejects it with PROTOCOL_ERROR rather than
-	// guessing at how to reach a service (spec §19).
+	// REST is the only protocol with an executor for the MVP (spec §20). A
+	// manifest asking for graphql, grpc, browser, or local is rejected with
+	// PROTOCOL_ERROR rather than guessed at, so the rejection stays honest as
+	// new executors land (spec §19).
 	d := daemon.New(daemon.Config{
 		Layout:  layout,
 		Version: version,
 		Socket:  *socket,
 		Log:     logDestination,
+		Executors: map[string]protocol.Executor{
+			"rest": rest.New(),
+		},
 	})
 
 	err = d.Run(ctx, func(socket string) {

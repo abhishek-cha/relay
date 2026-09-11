@@ -5,14 +5,17 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -20,6 +23,7 @@ import (
 
 	"relay/internal/build"
 	"relay/internal/ipc"
+	"relay/internal/mcp"
 	"relay/internal/paths"
 	"relay/internal/registry"
 	"relay/pkg/relay"
@@ -80,6 +84,10 @@ func run(args []string) int {
 		return runDaemon(args[1:])
 	case "logs":
 		return runLogs(args[1:])
+	case "mcp":
+		return runMCP(args[1:])
+	case "auth":
+		return runAuth(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "relay: %q is not implemented yet — see TASKS.md\n", args[0])
 		return 2
@@ -724,4 +732,288 @@ func showLogTail(path string, n int) error {
 		fmt.Println(line)
 	}
 	return nil
+}
+
+// ─── mcp ────────────────────────────────────────────────────────────────────
+
+// runMCP serves the registered tools to an MCP client over stdio (spec §27).
+//
+// stdout is the JSON-RPC channel and carries protocol frames only; every
+// diagnostic goes to stderr or --log, exactly as the tool binaries keep results
+// off their diagnostics stream (spec §10).
+func runMCP(args []string) int {
+	flags := flag.NewFlagSet("relay mcp", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	flags.Usage = func() {
+		fmt.Fprint(os.Stderr, "usage: relay mcp [--log PATH]\n")
+		flags.PrintDefaults()
+	}
+	logPath := flags.String("log", "", "append MCP diagnostics to this file (default: stderr)")
+
+	if err := flags.Parse(permute(flags, args)); err != nil {
+		return 2
+	}
+	if flags.NArg() != 0 {
+		flags.Usage()
+		return 2
+	}
+
+	diagnostics := io.Writer(os.Stderr)
+	if *logPath != "" {
+		file, err := os.OpenFile(*logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "relay: open log %s: %v\n", *logPath, err)
+			return 1
+		}
+		defer file.Close()
+		diagnostics = file
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := mcp.Run(ctx, paths.Default(), version, os.Stdin, os.Stdout, diagnostics); err != nil {
+		fmt.Fprintf(os.Stderr, "relay: mcp: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+// ─── auth ───────────────────────────────────────────────────────────────────
+
+// runAuth dispatches credential management (spec §21, §54).
+//
+// The CLI never stores a credential itself: it hands the secret to the daemon
+// once, and the daemon is what writes Keychain. Nothing here reports a secret
+// back, so a credential cannot leak through this command (spec §22, §40).
+func runAuth(args []string) int {
+	if len(args) == 0 {
+		fmt.Fprint(os.Stderr, "usage: relay auth <login|logout|status> <tool>\n")
+		return 2
+	}
+	switch args[0] {
+	case "login":
+		return runAuthLogin(args[1:])
+	case "logout":
+		return runAuthLogout(args[1:])
+	case "status":
+		return runAuthStatus(args[1:])
+	default:
+		fmt.Fprintf(os.Stderr, "relay auth: unknown subcommand %q\n", args[0])
+		return 2
+	}
+}
+
+// runAuthLogin stores a secret for a tool.
+//
+// The secret is read from the terminal with echo disabled, or from stdin when
+// stdin is not a terminal, so an unattended setup never has to put a credential
+// in argv where ps can see it. There is deliberately no --secret flag for that
+// reason, matching the argv caveat documented in internal/keychain.
+func runAuthLogin(args []string) int {
+	flags := flag.NewFlagSet("relay auth login", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	flags.Usage = func() {
+		fmt.Fprint(os.Stderr, "usage: relay auth login <tool> [--type TYPE]\n")
+		flags.PrintDefaults()
+	}
+	typeOverride := flags.String("type", "", "override the credential type declared by the manifest")
+
+	if err := flags.Parse(permute(flags, args)); err != nil {
+		return 2
+	}
+	if flags.NArg() != 1 {
+		flags.Usage()
+		return 2
+	}
+	tool := flags.Arg(0)
+
+	status, code := authStatus(tool)
+	if code != 0 {
+		return code
+	}
+
+	// The manifest is authoritative for what the tool needs, so the declared
+	// type wins unless the caller overrides it (spec §3, §21).
+	authType := *typeOverride
+	if authType == "" {
+		authType = status.AuthType
+	}
+	if authType == "" {
+		fmt.Fprintf(os.Stderr, "relay: %s declares no auth; pass --type if the service still needs a credential\n", tool)
+		return 2
+	}
+
+	secret, err := readSecret(fmt.Sprintf("Secret for %s (%s): ", tool, authType))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "relay: %v\n", err)
+		return 1
+	}
+	if secret == "" {
+		fmt.Fprintf(os.Stderr, "relay: empty secret; nothing stored\n")
+		return 1
+	}
+
+	layout := paths.Default()
+	req := relay.AuthSetRequest{Type: relay.FrameAuthSet, Tool: tool, AuthType: authType, Secret: secret}
+	var resp relay.MutationResponse
+	if err := ipc.Call(context.Background(), layout.Socket(), &req, &resp); err != nil {
+		return reportIPCError(err)
+	}
+	if !resp.Success {
+		return reportResponseError(resp.Error, "store credential")
+	}
+	fmt.Printf("stored %s credential for %s\n", authType, tool)
+	return 0
+}
+
+func runAuthLogout(args []string) int {
+	flags := flag.NewFlagSet("relay auth logout", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	flags.Usage = func() { fmt.Fprint(os.Stderr, "usage: relay auth logout <tool>\n") }
+	if err := flags.Parse(permute(flags, args)); err != nil {
+		return 2
+	}
+	if flags.NArg() != 1 {
+		flags.Usage()
+		return 2
+	}
+	tool := flags.Arg(0)
+
+	layout := paths.Default()
+	req := relay.AuthClearRequest{Type: relay.FrameAuthClear, Tool: tool}
+	var resp relay.MutationResponse
+	if err := ipc.Call(context.Background(), layout.Socket(), &req, &resp); err != nil {
+		return reportIPCError(err)
+	}
+	if !resp.Success {
+		return reportResponseError(resp.Error, "remove credential")
+	}
+	fmt.Printf("removed credential for %s\n", tool)
+	return 0
+}
+
+// runAuthStatus reports whether a credential exists and what the tool declares.
+func runAuthStatus(args []string) int {
+	flags := flag.NewFlagSet("relay auth status", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	flags.Usage = func() { fmt.Fprint(os.Stderr, "usage: relay auth status <tool> [--json]\n") }
+	jsonOut := flags.Bool("json", false, "print the status as JSON on stdout")
+	if err := flags.Parse(permute(flags, args)); err != nil {
+		return 2
+	}
+	if flags.NArg() != 1 {
+		flags.Usage()
+		return 2
+	}
+	tool := flags.Arg(0)
+
+	status, code := authStatus(tool)
+	if code != 0 {
+		return code
+	}
+
+	if *jsonOut {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(status); err != nil {
+			fmt.Fprintf(os.Stderr, "relay: encode status: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+
+	state := "not stored"
+	if status.Stored {
+		state = "stored"
+	}
+	summary := tool + ": " + state
+	if status.AuthType != "" {
+		summary += " (" + status.AuthType + ")"
+	}
+	fmt.Println(summary)
+	return 0
+}
+
+// authStatus asks the daemon for a tool's credential state.
+func authStatus(tool string) (relay.AuthStatusResponse, int) {
+	layout := paths.Default()
+	req := relay.AuthStatusRequest{Type: relay.FrameAuthStatus, Tool: tool}
+	var resp relay.AuthStatusResponse
+	if err := ipc.Call(context.Background(), layout.Socket(), &req, &resp); err != nil {
+		return resp, reportIPCError(err)
+	}
+	if !resp.Success {
+		return resp, reportResponseError(resp.Error, "read credential status")
+	}
+	return resp, 0
+}
+
+// reportIPCError maps a transport failure to an exit code and a message.
+func reportIPCError(err error) int {
+	if errors.Is(err, ipc.ErrUnavailable) {
+		fmt.Fprintf(os.Stderr, "relay: daemon is not running; start it with 'relay daemon start'\n")
+	} else {
+		fmt.Fprintf(os.Stderr, "relay: %v\n", err)
+	}
+	return 1
+}
+
+// reportResponseError prints a structured daemon error the way the rest of the
+// CLI does: code first, so the failure is recognizable (spec §26).
+func reportResponseError(structured *relay.Error, action string) int {
+	if structured != nil {
+		fmt.Fprintf(os.Stderr, "relay: %s: %s\n", structured.Code, structured.Message)
+	} else {
+		fmt.Fprintf(os.Stderr, "relay: %s failed\n", action)
+	}
+	return 1
+}
+
+// readSecret collects a credential without echoing it.
+//
+// A terminal read disables echo around the prompt; a piped stdin is read as one
+// line so automation never needs a TTY. Passing the secret through argv is
+// deliberately unsupported (spec §22).
+func readSecret(prompt string) (string, error) {
+	info, err := os.Stdin.Stat()
+	if err != nil {
+		return "", err
+	}
+
+	interactive := info.Mode()&os.ModeCharDevice != 0
+	if interactive {
+		fmt.Fprint(os.Stderr, prompt)
+		restore, err := echoOff()
+		if err != nil {
+			return "", err
+		}
+		defer restore()
+	}
+
+	reader := bufio.NewReader(os.Stdin)
+	line, err := reader.ReadString('\n')
+	if interactive {
+		fmt.Fprintln(os.Stderr)
+	}
+	if err != nil && !errors.Is(err, io.EOF) {
+		return "", err
+	}
+	return strings.TrimRight(line, "\r\n"), nil
+}
+
+// echoOff disables terminal echo for the duration of a secret read and returns
+// the restore function. stty is the dependency-free way to do this on macOS
+// without pulling in a terminal library.
+func echoOff() (func(), error) {
+	config := exec.Command("stty", "-echo")
+	config.Stdin = os.Stdin
+	if err := config.Run(); err != nil {
+		return nil, fmt.Errorf("disable terminal echo: %w", err)
+	}
+	return func() {
+		restore := exec.Command("stty", "echo")
+		restore.Stdin = os.Stdin
+		_ = restore.Run()
+	}, nil
 }
