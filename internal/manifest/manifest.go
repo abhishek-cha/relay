@@ -167,3 +167,23 @@ func (d *Document) Descriptor(hasSkill bool) relay.Descriptor {
 	}
 	return descriptor
 }
+
+// Operation finds a declared operation by its canonical name. It returns nil
+// when the manifest does not declare it.
+func (d *Document) Operation(name string) *Tool {
+	for i := range d.Tools {
+		if d.Tools[i].Name == name {
+			return &d.Tools[i]
+		}
+	}
+	return nil
+}
+
+// OperationNames returns the canonical names of every declared operation.
+func (d *Document) OperationNames() []string {
+	names := make([]string, 0, len(d.Tools))
+	for _, tool := range d.Tools {
+		names = append(names, tool.Name)
+	}
+	return names
+}

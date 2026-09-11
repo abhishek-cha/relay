@@ -2,6 +2,9 @@
 /dist/
 /bin/
 
+# Generated per-tool build modules (see internal/build)
+/build/
+
 # Generated single-tool binaries
 /relay
 /relayd
