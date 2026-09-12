@@ -5,6 +5,8 @@ on:
   pull_request:
 
 jobs:
+  # Fast, platform-neutral gates. These run on Linux because nothing in them
+  # touches macOS, so they stay cheap and quick to give feedback on.
   build:
     runs-on: ubuntu-latest
     steps:
@@ -20,5 +22,19 @@ jobs:
         run: go build ./...
       - name: test
         run: go test ./...
+
+  # The end-to-end suite drives the real relayd, and relayd reads credentials
+  # through /usr/bin/security — the macOS Keychain CLI. On Linux that binary
+  # does not exist, so every credential and session check fails for a reason
+  # that has nothing to do with the code under test. Relay is macOS-first by
+  # design (Keychain, LaunchAgent, security(1)), so this is the only place the
+  # suite can assert the credential seam truthfully.
+  e2e:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
       - name: e2e
         run: bash scripts/e2e.sh
