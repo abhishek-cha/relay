@@ -291,8 +291,15 @@ func TestAuthDeviceLoginStoresTheTokenWithoutLeakingIt(t *testing.T) {
 
 	// The token landed in the injected Keychain and nowhere else.
 	stored, err := kc.Get(keychain.Service("demo"), keychain.AccountDefault)
-	if err != nil || stored != "access-token-secret" {
-		t.Fatalf("stored credential = %q (%v), want the access token", stored, err)
+	if err != nil {
+		t.Fatalf("reading the stored credential: %v", err)
+	}
+	// It is stored as the versioned envelope: the envelope is what carries the
+	// refresh token and the endpoint context a later refresh needs, so a bare
+	// access token is the regression this guards against.
+	envelope, ok := auth.DecodeStoredToken(stored)
+	if !ok || envelope.AccessToken != "access-token-secret" || envelope.Flow != auth.FlowDevice {
+		t.Fatalf("stored credential is not a device-flow envelope carrying the access token: %q", stored)
 	}
 }
 
@@ -312,8 +319,12 @@ func TestAuthDeviceLoginPollsThroughAuthorizationPending(t *testing.T) {
 		t.Fatalf("token endpoint polled %d times, want 2", calls)
 	}
 	stored, err := kc.Get(keychain.Service("demo"), keychain.AccountDefault)
-	if err != nil || stored != "access-token-secret" {
-		t.Fatalf("stored credential = %q (%v), want the access token", stored, err)
+	if err != nil {
+		t.Fatalf("reading the stored credential: %v", err)
+	}
+	envelope, ok := auth.DecodeStoredToken(stored)
+	if !ok || envelope.AccessToken != "access-token-secret" {
+		t.Fatalf("stored credential is not an envelope carrying the access token: %q", stored)
 	}
 }
 

@@ -153,17 +153,20 @@ raw so `url.Values.Encode` owns query encoding.
 - [x] Credential types: API key, bearer token, basic auth, client credentials, OAuth2 — `internal/auth`
 - [x] macOS Keychain via the `security` CLI (or Security.framework); namespace `com.relay.<tool>`, account `default` — `internal/keychain`
 - [x] `relay auth login <tool>` / `logout` / `status` — the CLI hands the secret to the daemon once and never stores or echoes it
-- [x] OAuth2 device-code flow (RFC 8628) — the daemon owns the whole grant, holds the device code, polls, and writes the token straight to the Keychain; `relay auth login` prints the code and waits. A manifest that declares no device endpoints keeps the pasted-token path. PKCE remains open for a future browser flow (open decision #5, narrowed) — `internal/auth/device.go`, `internal/ipc/device.go`
+ - [x] OAuth2 device-code flow (RFC 8628) — the daemon owns the whole grant, holds the device code, polls, and writes the token straight to the Keychain; `relay auth login` prints the code and waits. A manifest that declares no device endpoints keeps the pasted-token path — `internal/auth/device.go`, `internal/ipc/device.go`
+ - [x] OAuth2 browser authorization-code flow with PKCE (S256) — `auth.authorizationEndpoint` in the manifest selects it; the daemon binds a loopback listener first, then mints `state` and the verifier, returns the authorize URL to the CLI, and completes the exchange when the redirect lands. `state` is compared in constant time before the code is touched, the verifier is sent only to the token endpoint, the callback path must match exactly, and the login handle is single-use with a ten-minute bound. No code, verifier, or token reaches a display path, and it is a public client: there is deliberately no client secret. Reached through `relay auth login <tool>`, which tries the browser flow before the device grant — `internal/auth/browser.go`, `internal/auth/browser_spec.go`, `internal/ipc/browser.go`, `internal/daemon/browser_auth.go`
 - [x] Daemon injects credentials at execution time (§22); the tool binary never handles secrets — resolved through `auth.Resolver`
 - [x] Redaction guarantees: secrets absent from CLI output, MCP output, logs, telemetry, manifests, skills — `internal/keychain/redact.go`
-- [x] `AUTH_REQUIRED` / `AUTH_FAILED` surfaced identically to CLI and MCP
+ - [x] `AUTH_REQUIRED` / `AUTH_FAILED` surfaced identically to CLI and MCP
+ - [x] Background refresh as a subcommand under `auth` — `relay auth refresh <tool>` / `relay auth refresh --all` (`--force` rotates even a fresh token, `--json` for machines); the daemon runs the RFC 6749 §6 exchange and rotates the Keychain entry, so nothing but the outcome crosses IPC. Exit status is the contract for unattended callers: a skip is 0, a failed result is 1, a usage problem is 2 — `internal/auth/token.go`, `internal/ipc/refresh.go`, `internal/daemon/refresh.go`, `cmd/relay/main.go`
 
-**Implemented in:** `internal/auth`, `internal/keychain`, `internal/daemon/auth.go`, `cmd/relay/main.go`.
+ **Implemented in:** `internal/auth` (device, browser, token envelope), `internal/keychain`, `internal/ipc` (device, browser, refresh frames), `internal/daemon` (auth, device_auth, browser_auth, refresh), `cmd/relay/main.go`.
 
 **Decisions taken:**
 
 - **Five credential types, one presentation table.** Each declared type maps to a conventional header: `api_key` to `X-API-Key`, `bearer` and `oauth2` to `Authorization: Bearer`, and `basic` plus `client_credentials` to HTTP Basic. No executor branches on the auth type, so the protocol stays an implementation detail (§19).
-- **The CLI never stores a secret.** `relay auth login` reads it with echo disabled (or from stdin when unattended) and hands it to the daemon, the only writer of Keychain. There is deliberately no `--secret` flag, because argv is visible to `ps`.
+ - **The CLI never stores a secret.** `relay auth login` reads it with echo disabled (or from stdin when unattended) and hands it to the daemon, the only writer of Keychain. There is deliberately no `--secret` flag, because argv is visible to `ps`.
+ - **One envelope, and the label is honest.** Every login — pasted, device, or browser — is stored as the same versioned `relay_oauth2` envelope, because that is what lets a later refresh find the token endpoint and client ID it needs. A pasted token gets the same shape but is reported as `pasted token` in `relay auth status`, since a credential that arrived by paste must not be described as a flow that never ran. A bare value written before the envelope existed still decodes verbatim, so nothing stored earlier stops working.
 
 **Verified:** an isolated `RELAY_HOME` round-trip — `relay auth login github` wrote `com.relay.github` to Keychain, `relay auth status` reported `authType: oauth2`, `relay auth logout` removed it, and `security find-generic-password -s com.relay.github` then reported the item missing. Grepping the temp home for the planted secret found nothing.
 
@@ -297,7 +300,7 @@ request input value finds nothing.
 
 - [x] A gRPC operation may name its method literally — `request.package` / `request.service` / `request.method` assemble `/package.Service/Method`; the fields are grpc-only, must be declared together, and `request.path` addressing still works, with both forms at once rejected as ambiguous — `internal/manifest`, `internal/protocol/grpc`
 - [x] The pagination opt-in crosses the MCP seam — an operation that declares a strategy advertises an optional `paginate` argument, the walk's `pages`/`truncated` shape rides in the MCP result, and a caller asking an incapable invoker to paginate is refused rather than handed page one — `internal/mcp`
-- [ ] Browser OAuth2 redirect/authorization-code login, which needs a loopback redirect and a browser handoff; the device grant in `internal/auth` covers the OAuth2 tools that can use it — `internal/browser`
+ - [x] Browser OAuth2 redirect/authorization-code login — it landed in `internal/auth/browser.go` with PKCE, a loopback listener, and a single-use ten-minute handle rather than in `internal/browser`; the device grant stays for tools that declare only device endpoints
 
 ## M11 — Security, permissions, distribution  (§24, §25, §40, §41, §47, §48, §49)
 

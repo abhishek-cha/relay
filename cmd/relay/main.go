@@ -1245,7 +1245,7 @@ func runMCP(args []string) int {
 // back, so a credential cannot leak through this command (spec §22, §40).
 func runAuth(args []string) int {
 	if len(args) == 0 {
-		fmt.Fprint(os.Stderr, "usage: relay auth <login|logout|status> <tool>\n")
+		fmt.Fprint(os.Stderr, "usage: relay auth <login|logout|status|refresh> <tool>\n")
 		return 2
 	}
 	switch args[0] {
@@ -1255,6 +1255,8 @@ func runAuth(args []string) int {
 		return runAuthLogout(args[1:])
 	case "status":
 		return runAuthStatus(args[1:])
+	case "refresh":
+		return runAuthRefresh(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "relay auth: unknown subcommand %q\n", args[0])
 		return 2
@@ -1304,6 +1306,12 @@ func runAuthLogin(args []string) int {
 	// An oauth2 tool whose manifest declares the device endpoints logs in
 	// without the user ever handling a token (spec §21, §54).
 	if authType == "oauth2" {
+		// The browser flow is tried first: it is the smoother login when the
+		// manifest declares one, and a manifest that declares only the device
+		// grant (or neither) falls through to the next branch unchanged.
+		if code, handled := runBrowserLogin(tool); handled {
+			return code
+		}
 		if code, handled := runDeviceLogin(tool); handled {
 			return code
 		}
@@ -1330,6 +1338,94 @@ func runAuthLogin(args []string) int {
 	}
 	fmt.Printf("stored %s credential for %s\n", authType, tool)
 	return 0
+}
+
+// browserLoginTimeout bounds the CLI's wait for a human to finish a browser
+// login.
+//
+// Unlike the device grant, whose authorization server declares an expiry the
+// wait can be derived from, the browser flow has no server-declared deadline.
+// The bound therefore comes from Relay itself and matches the daemon's own
+// pending-login lifetime (ten minutes): waiting any longer only turns a clean
+// "start the login again" into a timeout, because the daemon has already
+// forgotten the flow by then.
+const browserLoginTimeout = 10 * time.Minute
+
+// runBrowserLogin runs the OAuth2 authorization-code-with-PKCE login when the
+// tool's manifest declares a browser flow (spec §21, §22, §54).
+//
+// The daemon owns the whole exchange: it holds the PKCE verifier and the state,
+// binds the loopback listener, receives the authorization code, and writes the
+// token straight to the Keychain. This function only shows the human the
+// authorization URL and where the service will redirect, then asks the daemon
+// to finish. No token, code, verifier, or state ever reaches this process, so
+// the CLI has nothing secret to mishandle (spec §22).
+//
+// It reports handled=false for the case that is not a failure: an oauth2 tool
+// whose manifest declares no browser flow, which is the ordinary pasted-token
+// tool and must fall through silently so it is never worse off than before.
+// Any other reason the flow cannot run also falls back — with one stderr line
+// naming only the error code — so the device flow and the pasted-token path
+// still get their chance, mirroring runDeviceLogin.
+func runBrowserLogin(tool string) (int, bool) {
+	layout := paths.Default()
+	startRequest := ipc.AuthBrowserStartRequest{Type: ipc.FrameAuthBrowserStart, Tool: tool}
+	var start ipc.AuthBrowserStartResponse
+	if err := ipc.Call(context.Background(), layout.Socket(), &startRequest, &start); err != nil {
+		return reportIPCError(err), true
+	}
+	if !start.Success {
+		if start.Error == nil || start.Error.Details["browserFlow"] != false {
+			fmt.Fprintf(os.Stderr, "relay: browser login unavailable (%s); falling back\n",
+				browserFlowReason(start.Error))
+		}
+		return 0, false
+	}
+
+	// The authorization URL is safe to display: the PKCE challenge and the state
+	// are public by design, because they travel through the browser, and neither
+	// is useful without the verifier, which stays in the daemon along with any
+	// token (spec §22). This is also why no token ever reaches this process.
+	if start.URL != "" {
+		fmt.Println(start.URL)
+	}
+	if start.RedirectURI != "" {
+		fmt.Fprintf(os.Stderr, "relay: the browser will redirect to %s\n", start.RedirectURI)
+	}
+	// Opening the URL is a convenience for a desktop human on any platform that
+	// has an opener. It is best-effort: the URL is already on stdout, so a
+	// headless or non-macOS user loses nothing and a failed launch is not an
+	// error.
+	if start.URL != "" {
+		_ = exec.Command("open", start.URL).Run()
+	}
+
+	fmt.Fprintln(os.Stderr, "relay: waiting for the browser to finish...")
+
+	// The browser flow has no server-declared expiry, so the wait is bounded by
+	// the daemon's pending-login lifetime rather than the default exchange
+	// timeout.
+	waitRequest := ipc.AuthBrowserWaitRequest{Type: ipc.FrameAuthBrowserWait, Flow: start.Flow}
+	var wait ipc.AuthBrowserWaitResponse
+	if err := ipc.CallWithTimeout(context.Background(), layout.Socket(), browserLoginTimeout, &waitRequest, &wait); err != nil {
+		fmt.Fprintf(os.Stderr, "relay: %v\n", err)
+		return 1, true
+	}
+	if !wait.Success {
+		return reportResponseError(wait.Error, "complete the browser login"), true
+	}
+	fmt.Printf("stored oauth2 credential for %s\n", tool)
+	return 0, true
+}
+
+// browserFlowReason renders the daemon's reason for declining a browser login
+// without ever echoing a value back: only the code is printed. It mirrors
+// deviceFlowReason.
+func browserFlowReason(structured *relay.Error) string {
+	if structured == nil {
+		return "no detail"
+	}
+	return string(structured.Code)
 }
 
 // runDeviceLogin runs the OAuth2 device authorization grant when the tool's
@@ -1420,6 +1516,94 @@ func runAuthLogout(args []string) int {
 	return 0
 }
 
+// runAuthRefresh refreshes a stored OAuth2 credential now, or every tool's,
+// by asking the daemon to run the exchange (spec §21, §54).
+//
+// The frame exists for unattended callers such as cron jobs and LaunchAgents
+// (spec §54), so the exit status is the contract: a skip is a success, because
+// refreshing an already-fresh credential is a no-op by design rather than a
+// failure — a scheduled job that fires a minute early must not page anyone.
+// Only a result that carries an Error makes the command exit non-zero, and a
+// usage problem exits 2. The daemon performs the exchange and rotates the
+// Keychain entry; neither the refresh token nor the access token crosses IPC
+// in either direction (spec §22), so there is nothing here to print or leak.
+func runAuthRefresh(args []string) int {
+	flags := flag.NewFlagSet("relay auth refresh", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	flags.Usage = func() {
+		fmt.Fprint(os.Stderr, "usage: relay auth refresh <tool> [--force] [--json]\n")
+		fmt.Fprint(os.Stderr, "       relay auth refresh --all [--force] [--json]\n")
+	}
+	all := flags.Bool("all", false, "refresh every registered tool")
+	force := flags.Bool("force", false, "refresh even when the credential is not near expiry")
+	jsonOut := flags.Bool("json", false, "print the results as JSON on stdout")
+	if err := flags.Parse(permute(flags, args)); err != nil {
+		return 2
+	}
+
+	// Tool and --all are alternatives: exactly one of a single positional tool
+	// or a sweep of the whole registry must be given (spec §54).
+	tools := flags.Args()
+	if *all {
+		if len(tools) != 0 {
+			flags.Usage()
+			return 2
+		}
+	} else if len(tools) != 1 {
+		flags.Usage()
+		return 2
+	}
+
+	request := ipc.AuthRefreshRequest{Type: ipc.FrameAuthRefresh, All: *all, Force: *force}
+	if !*all {
+		request.Tool = tools[0]
+	}
+	var response ipc.AuthRefreshResponse
+	if err := ipc.Call(context.Background(), paths.Default().Socket(), &request, &response); err != nil {
+		return reportIPCError(err)
+	}
+	if !response.Success {
+		return reportResponseError(response.Error, "refresh credentials")
+	}
+
+	if *jsonOut {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(response); err != nil {
+			fmt.Fprintf(os.Stderr, "relay: encode refresh results: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+
+	// One line per result on stdout, so stdout stays the machine result while
+	// diagnostics go to stderr (spec §10). A failure is a diagnostic, so it goes
+	// to stderr; a skip is an ordinary outcome and stays on stdout.
+	failed := false
+	for _, result := range response.Results {
+		if result.Error != nil {
+			failed = true
+			fmt.Fprintf(os.Stderr, "%s: failed (%s: %s)\n", result.Tool, result.Error.Code, result.Error.Message)
+			continue
+		}
+		if result.Skipped != "" {
+			fmt.Printf("%s: skipped (%s)\n", result.Tool, result.Skipped)
+			continue
+		}
+		if result.Refreshed {
+			if result.ExpiresAt != "" {
+				fmt.Printf("%s: refreshed, expires %s\n", result.Tool, result.ExpiresAt)
+			} else {
+				fmt.Printf("%s: refreshed, expiry unknown\n", result.Tool)
+			}
+		}
+	}
+	if failed {
+		return 1
+	}
+	return 0
+}
+
 // runAuthStatus reports whether a credential exists and what the tool declares.
 func runAuthStatus(args []string) int {
 	flags := flag.NewFlagSet("relay auth status", flag.ContinueOnError)
@@ -1457,6 +1641,30 @@ func runAuthStatus(args []string) int {
 	summary := tool + ": " + state
 	if status.AuthType != "" {
 		summary += " (" + status.AuthType + ")"
+	}
+	// Append the non-secret summary the daemon can now provide: the login kind,
+	// the expiry, the scope, and whether a refresh token is stored (spec §21,
+	// §22). It is appended rather than restructured so the existing
+	// "<tool>: stored (oauth2)" prefix is unchanged for anything parsing it
+	// today. Only a stored credential has a summary to describe; a legacy daemon
+	// that sends none leaves the line exactly as it was.
+	if status.Stored && (status.LoginKind != "" || status.ExpiresAt != "" || status.Scope != "" || status.Refreshable) {
+		details := make([]string, 0, 4)
+		if status.LoginKind != "" {
+			details = append(details, status.LoginKind)
+		}
+		if status.ExpiresAt != "" {
+			details = append(details, "expires "+status.ExpiresAt)
+		} else {
+			details = append(details, "expiry unknown")
+		}
+		if status.Scope != "" {
+			details = append(details, "scope "+status.Scope)
+		}
+		if status.Refreshable {
+			details = append(details, "refreshable")
+		}
+		summary += " \u2014 " + strings.Join(details, ", ")
 	}
 	fmt.Println(summary)
 	return 0

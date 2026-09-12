@@ -1017,5 +1017,78 @@ revoked_err="$workdir/secure-revoked.err"
 check "browser operation after clear is AUTH_REQUIRED" "ok" "$(grep -q AUTH_REQUIRED "$revoked_err" && echo ok || echo bad)"
 "$workdir/relay" auth logout browserdemo >/dev/null 2>&1
 
+# --- 18. OAuth2 browser-flow validation and background refresh (spec §21, §54) ---
+echo "    oauth2 browser flow and background refresh (spec §21, §54)"
+
+# github declares oauth2 with neither a browser nor a device flow, so there is
+# nothing to exchange.  Refusing to guess is the point: the sweep reports the
+# skip on stdout and still exits 0, because a scheduled refresh of a credential
+# that cannot be refreshed is not a failure (spec §54).
+printf 'e2e-pasted-token\n' | "$workdir/relay" auth login github >/dev/null 2>&1
+refresh_all_out="$workdir/auth-refresh-all.out"
+refresh_all_err="$workdir/auth-refresh-all.err"
+check "refresh --all exits 0 when there is nothing to exchange" "0" "$("$workdir/relay" auth refresh --all > "$refresh_all_out" 2> "$refresh_all_err"; echo $?)"
+check "refresh --all reports the skip on stdout" "ok" "$(grep -q 'github: skipped' "$refresh_all_out" && echo ok || echo bad)"
+check "refresh --all never prints the token" "0" "$(cat "$refresh_all_out" "$refresh_all_err" | grep -c 'e2e-pasted-token')"
+check "refresh with an explicit tool exits 0 too" "0" "$("$workdir/relay" auth refresh github >/dev/null 2>&1; echo $?)"
+
+# Tool and --all are alternatives: neither, or both, is a usage error.
+check "refresh with no target is a usage error" "2" "$("$workdir/relay" auth refresh >/dev/null 2>&1; echo $?)"
+check "refresh with a tool and --all is a usage error" "2" "$("$workdir/relay" auth refresh github --all >/dev/null 2>&1; echo $?)"
+
+# A pasted token is wrapped in the same envelope an OAuth2 login writes, so it is
+# labelled honestly rather than reported as a flow that never ran (spec §21).
+status_out="$workdir/auth-status-envelope.out"
+"$workdir/relay" auth status github > "$status_out" 2>/dev/null
+check "auth status labels a pasted token" "ok" "$(grep -q 'pasted token' "$status_out" && echo ok || echo bad)"
+check "auth status never prints the token" "0" "$(grep -c 'e2e-pasted-token' "$status_out")"
+"$workdir/relay" auth logout github >/dev/null 2>&1
+
+# Naming an authorization endpoint declares the browser authorization-code flow;
+# the manifest must validate with no network access at all.
+cat > "$workdir/browserflow.yaml" <<MANIFEST
+apiVersion: relay/v1
+kind: Tool
+metadata:
+  name: browserflow
+  version: 1.0.0
+  description: offline browser-flow validation
+protocol:
+  type: rest
+  baseUrl: https://api.example.test
+auth:
+  type: oauth2
+  authorizationEndpoint: https://example.test/oauth/authorize
+  tokenEndpoint: https://example.test/oauth/token
+  clientId: relay-e2e
+  redirectURI: http://127.0.0.1:8765/callback
+tools:
+  - name: ping
+    description: nothing is sent
+    request:
+      method: GET
+      path: /ping
+MANIFEST
+check "a browser-flow manifest builds" "0" "$("$workdir/relay" build "$workdir/browserflow.yaml" --out "$workdir/browserflow" >/dev/null 2>&1; echo $?)"
+
+# The loopback redirect is the security boundary: anything a local listener
+# cannot receive is refused, and the message names the field but never echoes
+# the offending value back into a log.
+sed 's#http://127.0.0.1:8765/callback#https://evil.example.test/callback#' \
+    "$workdir/browserflow.yaml" > "$workdir/browserflow-bad-redirect.yaml"
+bad_redirect_err="$workdir/browserflow-bad-redirect.err"
+check "a non-loopback redirect is refused" "1" "$("$workdir/relay" build "$workdir/browserflow-bad-redirect.yaml" --out "$workdir/browserflow-bad" >/dev/null 2>"$bad_redirect_err"; echo $?)"
+check "the refusal names the field and not the value" "ok" "$(python3 - "$bad_redirect_err" <<'PY'
+import sys
+t = open(sys.argv[1]).read()
+print("ok" if "auth.redirectURI" in t and "evil.example.test" not in t else "bad")
+PY
+)"
+
+# The two flows are mutually exclusive; declaring both leaves it ambiguous which
+# grant the daemon should own.
+sed 's#  tokenEndpoint:.*#  deviceAuthorizationEndpoint: https://example.test/oauth/device\n  tokenEndpoint: https://example.test/oauth/token#' \
+    "$workdir/browserflow.yaml" > "$workdir/browserflow-both.yaml"
+check "declaring both flows at once is refused" "1" "$("$workdir/relay" build "$workdir/browserflow-both.yaml" --out "$workdir/browserflow-both" >/dev/null 2>&1; echo $?)"
 echo "passed: $passed   failed: $failed"
 [ "$failed" -eq 0 ]

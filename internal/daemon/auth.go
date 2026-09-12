@@ -112,6 +112,30 @@ func (d *Daemon) authStatus(ctx context.Context, request relay.AuthStatusRequest
 		response.AuthType = declared.Type
 		response.Provider = declared.Provider
 	}
+	// When something is stored, summarize its non-secret metadata: how the login
+	// was obtained and when it expires. This is metadata only — no token value is
+	// ever read out here, let alone returned (spec §22).
+	if stored {
+		envelope, ok, failure := d.resolver.Stored(installation.Name)
+		if failure != nil {
+			return failedAuthStatus(failure)
+		}
+		switch {
+		case ok:
+			kind := "oauth2"
+			if flow := strings.TrimSpace(envelope.Flow); flow != "" {
+				kind += " " + flow
+			}
+			response.LoginKind = kind
+			response.ExpiresAt = envelope.ExpiresAt
+			response.Scope = envelope.Scope
+			response.Refreshable = strings.TrimSpace(envelope.RefreshToken) != ""
+		default:
+			// A stored value that is not an envelope is a token a human pasted
+			// (spec §59); it carries no envelope metadata to summarize.
+			response.LoginKind = "pasted token"
+		}
+	}
 	return response
 }
 
@@ -251,11 +275,38 @@ func (d *Daemon) authDeviceWait(ctx context.Context, request ipc.AuthDeviceWaitR
 		return failedDeviceWait(failure)
 	}
 	// The token goes straight to the Keychain; it is never logged, echoed, or
-	// included in a reply (spec §22, §54).
-	if failure := d.resolver.Set(record.tool, token.AccessToken); failure != nil {
+	// included in a reply (spec §22, §54). When it came with a refresh token it
+	// is written as the versioned envelope: that envelope is what carries the
+	// refresh token forward, and the previous bare-string write is exactly what
+	// dropped the refresh token and made background refresh impossible.
+	encoded, failure := encodeLoginCredential(*token, auth.FlowDevice,
+		record.spec.TokenEndpoint, record.spec.ClientID)
+	if failure != nil {
+		return failedDeviceWait(failure)
+	}
+	if failure := d.resolver.Set(record.tool, encoded); failure != nil {
 		return failedDeviceWait(failure)
 	}
 	return ipc.AuthDeviceWaitResponse{Success: true, Tool: record.tool, Stored: true}
+}
+
+// encodeLoginCredential renders a freshly obtained OAuth2 token as the single
+// string to store in the Keychain.
+//
+// Every credential an authorization flow obtains is stored as the versioned
+// envelope, uniformly (spec §21, §22). The envelope is what carries the refresh
+// token — and the expiry, endpoint, and client context a later background
+// refresh needs — forward; storing the bare access token is exactly what
+// dropped the refresh token and made refresh impossible (spec §54).
+//
+// The envelope is also what keeps a stored credential labelled honestly. A
+// stored value that is not an envelope means a token a human pasted, so writing
+// a bare string here would make 'relay auth status' report a flow the human did
+// perform as "pasted token" (spec §59). Every reader unwraps the envelope, so
+// the credential that goes on the wire is the same access token as before.
+func encodeLoginCredential(token auth.Token, flow, tokenEndpoint, clientID string) (string, *relay.Error) {
+	stored := auth.NewStoredToken(token, flow, tokenEndpoint, clientID)
+	return auth.EncodeStoredToken(stored)
 }
 
 // sweepDeviceLoginsLocked drops authorizations that can no longer complete, so

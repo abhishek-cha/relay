@@ -58,3 +58,53 @@ func TestConfirmedByHuman(t *testing.T) {
 		})
 	}
 }
+
+// TestAuthVerbUsageErrors pins the auth dispatcher's argument handling: a
+// missing or unknown subcommand is a usage error (exit 2) rather than a failed
+// daemon call (spec §10, §21, §54). The bare usage text names every subcommand,
+// including the refresh verb this change adds.
+func TestAuthVerbUsageErrors(t *testing.T) {
+	tests := []struct {
+		name     string
+		args     []string
+		wantText string
+	}{
+		{name: "no subcommand names refresh", args: nil, wantText: "refresh"},
+		{name: "unknown subcommand", args: []string{"frobnicate", "demo"}, wantText: "unknown subcommand"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var code int
+			got := captureStderr(t, func() { code = runAuth(test.args) })
+			if code != 2 {
+				t.Fatalf("exit = %d, want 2", code)
+			}
+			if !strings.Contains(got, test.wantText) {
+				t.Fatalf("stderr = %q, want it to contain %q", got, test.wantText)
+			}
+		})
+	}
+}
+
+// TestAuthRefreshArgumentContract pins that exactly one of a named tool or
+// --all is required (spec §54): every other shape is a usage problem (exit 2)
+// resolved before any daemon call, so no daemon is needed to exercise it.
+func TestAuthRefreshArgumentContract(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "neither a tool nor --all", args: nil},
+		{name: "two positional tools", args: []string{"a", "b"}},
+		{name: "both --all and a tool", args: []string{"--all", "demo"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var code int
+			captureStderr(t, func() { code = runAuthRefresh(test.args) })
+			if code != 2 {
+				t.Fatalf("exit = %d, want 2", code)
+			}
+		})
+	}
+}

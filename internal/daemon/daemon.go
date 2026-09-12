@@ -246,6 +246,27 @@ func (d *Daemon) Handle(ctx context.Context, kind string, frame []byte) (any, er
 		}
 		return d.authDeviceWait(ctx, request), nil
 
+	case ipc.FrameAuthBrowserStart:
+		var request ipc.AuthBrowserStartRequest
+		if failure := decode(frame, &request); failure != nil {
+			return failedBrowserStart(failure), nil
+		}
+		return d.authBrowserStart(ctx, request), nil
+
+	case ipc.FrameAuthBrowserWait:
+		var request ipc.AuthBrowserWaitRequest
+		if failure := decode(frame, &request); failure != nil {
+			return failedBrowserWait(failure), nil
+		}
+		return d.authBrowserWait(ctx, request), nil
+
+	case ipc.FrameAuthRefresh:
+		var request ipc.AuthRefreshRequest
+		if failure := decode(frame, &request); failure != nil {
+			return failedAuthRefresh(failure), nil
+		}
+		return d.authRefresh(ctx, request), nil
+
 	case ipc.FrameSessionLogin:
 		var request ipc.SessionLoginRequest
 		if failure := decode(frame, &request); failure != nil {
