@@ -27,6 +27,12 @@ const (
 	ExitUsage = 2
 )
 
+// paginateFlag is the reserved operation flag that opts a call into the
+// operation's declared pagination walk (spec §20). It exists only on an
+// operation whose manifest declares a pagination strategy, mirroring how the
+// MCP adapter reserves the same name only there.
+const paginateFlag = "paginate"
+
 // Assets are the pieces embedded into a built tool binary: its manifest and its
 // skill (spec §8).
 type Assets struct {
@@ -103,7 +109,7 @@ func (a *App) Run(ctx context.Context, args []string) int {
 			fmt.Sprintf("unknown operation %q", rest[0])))
 	}
 
-	input, outcome, inputErr := a.parseInput(tool, rest[1:])
+	input, paginate, outcome, inputErr := a.parseInput(tool, rest[1:])
 	if inputErr != nil {
 		return a.fail(jsonOut, inputErr)
 	}
@@ -117,6 +123,7 @@ func (a *App) Run(ctx context.Context, args []string) int {
 		Tool:      a.Manifest.Metadata.Name,
 		Operation: tool.Name,
 		Input:     input,
+		Paginate:  paginate,
 	})
 	if invokeErr != nil {
 		var structured *relay.Error
@@ -132,7 +139,30 @@ func (a *App) Run(ctx context.Context, args []string) int {
 		return a.fail(jsonOut, response.Error)
 	}
 
+	a.reportPagination(response)
 	return a.succeed(jsonOut, response.Result)
+}
+
+// reportPagination writes a paginated walk's shape to stderr, leaving stdout as
+// the machine result alone (spec §10, §20). It is silent for an ordinary
+// invocation, so a single-request call emits nothing extra, and it names a
+// truncated walk explicitly so a bounded result is never read as complete. It
+// mirrors the CLI's reportPagination, prefixed with the tool's own name the way
+// every other runtime diagnostic is.
+func (a *App) reportPagination(response relay.InvokeResponse) {
+	if response.Pages <= 0 {
+		return
+	}
+	unit := "pages"
+	if response.Pages == 1 {
+		unit = "page"
+	}
+	if response.Truncated {
+		fmt.Fprintf(a.Stderr, "%s: collected %d %s; the result is truncated and may be incomplete\n",
+			a.Manifest.Metadata.Name, response.Pages, unit)
+		return
+	}
+	fmt.Fprintf(a.Stderr, "%s: collected %d %s\n", a.Manifest.Metadata.Name, response.Pages, unit)
 }
 
 // manifest writes the raw embedded manifest bytes verbatim to stdout (spec §13,
@@ -221,14 +251,28 @@ const (
 )
 
 // parseInput turns an operation's flags into its input object, then validates
-// it. Every failure becomes a structured error, so stderr carries exactly one
-// diagnostic rather than a duplicated usage dump.
-func (a *App) parseInput(tool *manifest.Tool, args []string) (map[string]any, parseOutcome, *relay.Error) {
+// it. It also reports the reserved --paginate opt-in, which is accepted only on
+// an operation whose manifest declares a pagination strategy (spec §20). Every
+// failure becomes a structured error, so stderr carries exactly one diagnostic
+// rather than a duplicated usage dump.
+func (a *App) parseInput(tool *manifest.Tool, args []string) (map[string]any, bool, parseOutcome, *relay.Error) {
 	flags := flag.NewFlagSet(tool.Name, flag.ContinueOnError)
 	// The flag package would otherwise print its own message and usage before
 	// returning; suppress that and report once, structurally.
 	flags.SetOutput(io.Discard)
 	flags.Usage = func() {}
+
+	// --paginate is reserved only where the manifest declares a walk. Registering
+	// it solely there means an operation that cannot paginate has no such flag, so
+	// asking it to is refused as INVALID_INPUT rather than silently ignored — the
+	// same choice the MCP adapter makes by reserving the name only on a capable
+	// operation.
+	paginates := tool.Request.Pagination != nil
+	var paginate bool
+	if paginates {
+		flags.BoolVar(&paginate, paginateFlag, false,
+			"follow the operation's declared pagination and collect the whole result")
+	}
 
 	// Explicit JSON input for complex objects (spec §11).
 	inputFile := flags.String("input", "", "read the operation input from a JSON file")
@@ -236,6 +280,10 @@ func (a *App) parseInput(tool *manifest.Tool, args []string) (map[string]any, pa
 
 	values := map[string]*flagValue{}
 	for name, property := range tool.Input.Properties {
+		if paginates && name == paginateFlag {
+			// The reserved walk opt-in wins the name, exactly as it does over MCP.
+			continue
+		}
 		if value := newFlagValue(flags, name, property); value != nil {
 			values[name] = value
 		}
@@ -243,29 +291,29 @@ func (a *App) parseInput(tool *manifest.Tool, args []string) (map[string]any, pa
 
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
-			return nil, parseHelp, nil
+			return nil, false, parseHelp, nil
 		}
-		return nil, parseOK, relay.NewError(relay.CodeInvalidInput, err.Error())
+		return nil, false, parseOK, relay.NewError(relay.CodeInvalidInput, err.Error())
 	}
 	if flags.NArg() > 0 {
-		return nil, parseOK, relay.NewError(relay.CodeInvalidInput,
+		return nil, false, parseOK, relay.NewError(relay.CodeInvalidInput,
 			fmt.Sprintf("unexpected argument %q", flags.Arg(0)))
 	}
 
 	input := map[string]any{}
 	switch {
 	case *inputFile != "" && *inputJSON != "":
-		return nil, parseOK, relay.NewError(relay.CodeInvalidInput,
+		return nil, false, parseOK, relay.NewError(relay.CodeInvalidInput,
 			"--input and --input-json are mutually exclusive")
 	case *inputFile != "":
 		loaded, fileErr := readInputFile(*inputFile)
 		if fileErr != nil {
-			return nil, parseOK, fileErr
+			return nil, false, parseOK, fileErr
 		}
 		input = loaded
 	case *inputJSON != "":
 		if err := json.Unmarshal([]byte(*inputJSON), &input); err != nil {
-			return nil, parseOK, relay.NewError(relay.CodeInvalidInput,
+			return nil, false, parseOK, relay.NewError(relay.CodeInvalidInput,
 				fmt.Sprintf("--input-json is not a JSON object: %v", err))
 		}
 	}
@@ -285,10 +333,10 @@ func (a *App) parseInput(tool *manifest.Tool, args []string) (map[string]any, pa
 	// The daemon still validates again, because a tool binary is untrusted and
 	// the trusted component cannot assume its caller did the work.
 	if failure := tool.ValidateInput(input); failure != nil {
-		return nil, parseOK, failure
+		return nil, false, parseOK, failure
 	}
 
-	return input, parseOK, nil
+	return input, paginate, parseOK, nil
 }
 
 // usage is the human-oriented help text (spec §9).
@@ -316,6 +364,9 @@ func (a *App) operationUsage(tool *manifest.Tool) string {
 		a.Manifest.Metadata.Name, operationName(tool.Name), tool.Description)
 	for name, property := range tool.Input.Properties {
 		fmt.Fprintf(&builder, "  --%s (%s)%s\n", name, property.Type, requiredNote(tool, name))
+	}
+	if tool.Request.Pagination != nil {
+		builder.WriteString("  --paginate (boolean) follow the operation's declared pagination and collect the whole result\n")
 	}
 	return builder.String()
 }

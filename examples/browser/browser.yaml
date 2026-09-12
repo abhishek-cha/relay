@@ -1,0 +1,71 @@
+# A service with no usable API — the browser protocol (spec §23).
+#
+# This tool talks to a web application the way a logged-in human does: Relay
+# performs the login once, stores the resulting cookie in the daemon's session
+# store, and attaches it to every later operation. There is no JavaScript engine
+# here; the operations themselves are ordinary HTTP requests that carry the
+# session.
+#
+# Two declarations do the work:
+#
+#   auth.type: basic              the credential shape — a user:password pair
+#   auth.login.{kind, path, ...}  how to turn that credential into a session
+#
+# A browser tool that declares no auth.login needs no session, and asking to log
+# one in fails loudly rather than guessing at a flow.
+apiVersion: relay/v1
+kind: Tool
+metadata:
+  name: dashboard
+  version: 0.1.0
+  description: Read reports from a web dashboard that has no public API
+
+runtime:
+  name: relay
+  apiVersion: v1
+
+protocol:
+  type: browser
+  baseUrl: https://dashboard.example.com
+
+auth:
+  type: basic
+  login:
+    kind: form
+    method: POST
+    path: /login
+    usernameField: email
+    passwordField: password
+
+capabilities:
+  - network
+  - keychain
+  - browser
+
+permissions:
+  network:
+    hosts:
+      - dashboard.example.com
+
+tools:
+  - name: list_reports
+    description: List the reports the logged-in account can see
+    input:
+      type: object
+    request:
+      method: GET
+      path: /reports
+
+  - name: get_report
+    description: Fetch one report as it is served to the browser
+    input:
+      type: object
+      properties:
+        id:
+          type: string
+          description: A report id, from list_reports
+      required:
+        - id
+    request:
+      method: GET
+      path: /reports/{id}

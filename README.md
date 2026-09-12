@@ -31,7 +31,7 @@ tool is implemented in is not.
 | You want to | Start at |
 | --- | --- |
 | **Use** a tool someone else built - give your shell and your MCP client access to an API | [Quickstart](#quickstart) |
-| **Package** your own API, or a local capability, as a CLI + MCP tool | [Package your own API](#package-your-own-api) |
+| **Package** your own API as a CLI + MCP tool | [Package your own API](#package-your-own-api) |
 
 ## How it fits together
 
@@ -301,9 +301,12 @@ relay install dist/mytool        # verifies the sidecar .sig before copying anyt
 
 ---
 
-## Manifest reference
+## Manifest at a glance
 
-### Top level
+A manifest has three parts: who the tool is, how to reach the service, and what
+operations exist. The walkthrough above covers the common shape; the complete field
+reference — every protocol, credential type, and pagination style — lives in
+[`docs/CAPABILITIES.md`](docs/CAPABILITIES.md).
 
 | Key | Required | Notes |
 | --- | --- | --- |
@@ -313,156 +316,37 @@ relay install dist/mytool        # verifies the sidecar .sig before copying anyt
 | `metadata.version` | yes | paired with the skill's version |
 | `metadata.description` | no | one line |
 | `runtime` | no | `{name: relay, apiVersion: v1}`; a mismatch is refused at install |
-| `protocol` | yes | `type` plus its address (below) |
-| `auth` | no | see [Authentication](#authentication) |
-| `capabilities` | no | opt in to the capability model (below) |
+| `protocol` | yes | `rest`, `graphql`, `grpc`, or `browser`, plus that protocol's address |
+| `auth` | no | the credential the daemon must hold; omit it for a tool that needs none |
+| `capabilities` | no | opt in to the capability model |
 | `permissions` | no | narrows what those capabilities may touch |
 | `tools` | yes | at least one operation |
 
-`protocol.type` is one of `rest`, `graphql`, `grpc`, `browser`, `local`. `baseUrl` is
-required for `rest`, `endpoint` for `graphql`; a `local` capability declares neither,
-because it has no service.
-
-### An operation (`tools[]`)
-
-| Key | Required | Notes |
-| --- | --- | --- |
-| `name` | yes | lowercase snake_case; `get_thing` becomes `get-thing` on the CLI and `mytool_get_thing` over MCP |
-| `description` | yes | shown in `--help` and in an MCP client's tool list |
-| `input` | yes | a JSON-Schema subset with `type: object`, `properties`, and `required` |
-| `request` | yes | how to reach it; shape depends on the protocol |
-
-### Input properties
-
-| Key | Notes |
-| --- | --- |
-| `type` | `string`, `integer`, `number`, `boolean`, `array`, or `object` |
-| `description` | becomes the flag's help text |
-| `default` | used when the flag is omitted |
-| `enum` | restricts the accepted values |
-| `items` | element schema, for `array` |
-| `format` | a passthrough hint, such as `date-time` |
-
-Every property becomes a `--flag` on the generated CLI, so `owner` is `--owner`. A
-complex input can also be passed whole with `--input <file.json>` or `--input-json
-'<json>'; an explicitly passed flag wins over either.
-
-### Request (REST)
-
-| Key | Notes |
-| --- | --- |
-| `method` | `GET`, `POST`, `PUT`, `PATCH`, or `DELETE` |
-| `path` | required; `{param}` placeholders are filled from input |
-| `query` | map of parameter name to template, e.g. `limit: "{limit}"` |
-| `headers` | map of header name to template |
-| `body` | an explicit JSON body; omit it to send the remaining inputs instead |
-| `pagination` | optional; see below |
-
-Path placeholders are `url.PathEscape`d. Query and header values are substituted raw and
-then encoded by `url.Values`, so you do not escape them yourself.
-
-### Pagination
-
-| Key | Notes |
-| --- | --- |
-| `style` | `link-header` follows the RFC 8288 `Link rel="next"` response header (GitHub, Stripe); `cursor` echoes a value from the response body |
-| `cursorParam` | cursor style only; the request parameter that carries the cursor |
-| `cursorField` | cursor style only; dotted path in the JSON body holding the next cursor |
-| `cursorIn` | cursor style only; `query` or `body` |
-| `hasMoreField` | cursor style only; optional dotted path to a bool or number that stops the walk early |
-| `limitParam` / `limit` | optional page-size parameter and its default |
-
-Pagination is REST-only and only applies to a `GET` or `HEAD`. Declaring it does not
-change the default call: the walk stays opt-in, so a caller has to ask for it. Use
-`relay run <tool> <operation> --paginate` on the command line, or pass `paginate: true`
-over MCP; a plain `mytool search-things` still makes exactly one request.
-
-### Other protocols
-
-| `protocol.type` | Request shape |
-| --- | --- |
-| `graphql` | `request.document` holds the query or mutation; `request.variables` maps a variable to the input property that supplies it (defaulting to a same-named property) |
-| `grpc` | address the method either with `request.path` or with `request.package` + `request.service` + `request.method`, never both |
-| `local` | `request.operation` names the primitive, e.g. `read_file` or `git_status`; the address-shaped fields are rejected |
-
-### Capabilities and permissions
-
-A tool states what it needs, and the daemon enforces it before it reads a credential or
-dispatches an executor:
-
-```yaml
-capabilities:
-  - network
-  - keychain
-permissions:
-  network:
-    hosts:
-      - api.example.com
-```
-
-`capabilities` draws from a fixed set: `network`, `keychain`, `browser`, `filesystem.read`,
-`filesystem.write`, `shell`, `notifications`, `clipboard`. `permissions` narrows those
-capabilities to specific hosts and filesystem scopes.
-
-The model is **opt-in per tool**. A manifest that declares neither key runs unchecked,
-which keeps tools written before the model existed working unchanged. Declare either one
-and the tool is then held default-deny: an unnamed capability is refused, and a host that
-is not in the allowlist is refused. Destructive operations are gated on top of that, and
-the gate applies whether or not the tool declares a capability surface; the list lives in
-`~/.relay/config/permissions.yaml`.
-
----
+Each operation needs a snake_case `name`, a `description`, an `input` schema, and a
+`request` shaped by the protocol. Everything else — the other protocols, the OAuth2 and
+browser login setups, pagination, and the on-disk config files — is in the
+[capabilities reference](docs/CAPABILITIES.md).
 
 ## Authentication
 
 Credentials are owned by the daemon and stored in the macOS Keychain under
-`com.relay.<tool>`. A tool binary never sees one, so a credential cannot reach stdout,
-a log, telemetry, the manifest, or the skill. The manifest declares only *what kind* of
-credential is required.
-
-### Credential types
-
-| `auth.type` | Sent as |
-| --- | --- |
-| `api_key` | `X-API-Key: <secret>` |
-| `bearer` | `Authorization: Bearer <secret>` |
-| `basic` | HTTP Basic |
-| `client_credentials` | HTTP Basic |
-| `oauth2` | `Authorization: Bearer <token>` |
-
-No executor branches on the auth type; it just attaches the header, so the protocol stays
-an implementation detail.
-
-### OAuth2: three ways to log in
-
-Declaring `auth.type: oauth2` and nothing else means a human pastes a token once. Add
-endpoints and the daemon runs the grant itself:
-
-| Manifest fields | Login flow |
-| --- | --- |
-| `type: oauth2` | paste a token - `relay auth login <tool>` prompts with echo disabled |
-| `+ deviceAuthorizationEndpoint`, `tokenEndpoint`, `clientId`, `scopes` | device authorization grant (RFC 8628); the CLI prints a code and waits |
-| `+ authorizationEndpoint`, `tokenEndpoint`, `clientId`, `scopes`, optional `redirectURI` | browser authorization code with PKCE; Relay binds a loopback listener, opens the URL, and completes the exchange when you land on it |
-
-The device and browser flows are mutually exclusive, and both are public clients: there is
-deliberately no client secret field. A `redirectURI` must be `http` on `127.0.0.1` or
-`localhost`, with no query or fragment - anything else cannot safely receive the code.
-`relay auth login <tool>` tries the browser flow first and falls through to the device
-grant or the paste prompt, so the manifest decides and the command stays the same.
-
-### Refreshing
+`com.relay.<tool>`. The manifest declares only *what kind* of credential is required; the
+secret never appears in the manifest, and never reaches the tool binary, so it cannot leak
+into stdout, a log, telemetry, or MCP output.
 
 ```sh
-relay auth refresh mytool        # refresh one credential
-relay auth refresh --all         # refresh every registered tool
-relay auth refresh --all --force # rotate even a credential that is still fresh
+relay auth login mytool          # store a credential
+relay auth status mytool         # the type, expiry, scope, and whether it refreshes
+relay auth refresh --all         # rotate what is due (safe to schedule; a skip exits 0)
+relay auth logout mytool         # forget it
 ```
 
-The exchange happens in the daemon and rotates the Keychain entry; no token crosses IPC,
-so there is nothing for the command to print. Exit status is the contract, which makes it
-safe to schedule: a skip is `0` (refreshing an already-fresh token is a no-op, so a job
-that fires a minute early must not page anyone), a failed result is `1`, and a usage
-problem is `2`. `--json` prints the per-tool outcome for a machine consumer.
+The five credential types — `api_key`, `bearer`, `basic`, `client_credentials`, and
+`oauth2` — all live in the manifest's `auth` block and all reach the wire the same way,
+attached by the daemon rather than by the tool. For OAuth2 there are three login flavours
+(paste a token, device grant, or browser with PKCE) and one command; the manifest picks
+the flow. The [capabilities reference](docs/CAPABILITIES.md#credential-setups) has each
+one in full.
 
 ---
 
@@ -478,6 +362,7 @@ Every built tool implements the same stable interface:
 | `--help` | human help | usage and the operation list |
 | `--version` | `<name> <version>` | tool identity |
 | `--json` | JSON envelope | wraps a result or an error for machine consumers |
+| `--paginate` | stderr note | walks an operation's declared pages; accepted only where the manifest declares a pagination strategy |
 
 ## The output contract
 
@@ -538,7 +423,7 @@ relay/
 │   ├── auth/           # credential resolution, device + browser OAuth2
 │   ├── keychain/       # macOS Keychain integration
 │   ├── browser/        # sessions, login, cookies
-│   ├── protocol/       # the Executor seam: rest, graphql, grpc, browser, local
+│   ├── protocol/       # the Executor seam: rest, graphql, grpc, browser
 │   ├── mcp/            # MCP adapter over the same execution path
 │   ├── telemetry/      # local, privacy-first usage events
 │   ├── permissions/    # capability and permission policy
@@ -560,6 +445,7 @@ registry, config, and logs. Both are generated.
 
 ## Documentation
 
+- [`docs/CAPABILITIES.md`](docs/CAPABILITIES.md) - every manifest field: protocols, credential setups, capabilities, pagination, and the config files.
 - [`docs/DESIGN.md`](docs/DESIGN.md) - the complete design spec.
 - [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md) - how to add and verify a tool.
 - [`examples/`](examples/) - worked manifests, including the caveats each one carries.
@@ -568,9 +454,9 @@ registry, config, and logs. Both are generated.
 ## Status
 
 The core loop works end to end: write a manifest, build a tool, inspect it, run the
-daemon, install the tool, and execute the same capability through the CLI and through MCP.
-REST, GraphQL, gRPC, browser, and local capabilities each have an executor wired into the
-daemon behind one seam.
+daemon, install the tool, and execute the same capability through the CLI, through the
+tool binary, and through MCP. REST, GraphQL, gRPC, and browser tools each have an executor
+wired into the daemon behind one seam.
 
 Credentials live in the macOS Keychain and are managed with `relay auth`; `relay stats`
 reads the local telemetry stream. The daemon enforces declared capabilities and

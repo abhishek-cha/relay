@@ -310,7 +310,7 @@ func TestValidateAggregatesProblems(t *testing.T) {
 func TestValidateExampleManifests(t *testing.T) {
 	examples := []string{
 		"../../examples/github/github.yaml",
-		"../../examples/filesystem/filesystem.yaml",
+		"../../examples/browser/browser.yaml",
 		"../../examples/slack/slack.yaml",
 		"../../examples/stripe/stripe.yaml",
 		"../../templates/tool.yaml",

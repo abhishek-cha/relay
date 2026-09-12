@@ -832,6 +832,23 @@ check "list_pages --paginate reports the walk on stderr" "ok" "$(grep -q 'collec
 check "list_pages --paginate stdout is still pure JSON" "ok" "$(python3 -c 'import json,sys; json.load(open(sys.argv[1])); print("ok")' "$paged_out" 2>&1)"
 check "list_pages --paginate never mixes a diagnostic into stdout" "ok" "$(grep -q 'collected\|relay:' "$paged_out" && echo bad || echo ok)"
 
+# The built tool binary accepts --paginate itself, so a shipped tool walks its
+# declared Link chain directly instead of only `relay run` being able to. The
+# walk is reported on stderr and stdout stays the pure machine result.
+pagedemo_tool="$RELAY_HOME/tools/pagedemo"
+before=$(wc -l < "$sportlog" | tr -d ' ')
+built_out="$workdir/pages-built.out"
+built_err="$workdir/pages-built.err"
+"$pagedemo_tool" list_pages --paginate > "$built_out" 2> "$built_err"
+check "built tool --paginate exits 0" "0" "$?"
+check "built tool --paginate walks all three pages" "3" "$(( $(wc -l < "$sportlog" | tr -d ' ') - before ))"
+check "built tool --paginate walks the Link chain in order" "GET /pages|GET /pages?page=2|GET /pages?page=3|" "$(tail -n 3 "$sportlog" | tr '\n' '|')"
+check "built tool --paginate aggregates every page" "ok" \
+    "$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("ok" if d == {"items": ["a", "b", "c", "d", "e"]} else "bad:" + repr(d))' "$built_out" 2>&1)"
+check "built tool --paginate reports the walk on stderr" "ok" "$(grep -q 'collected 3 pages' "$built_err" && echo ok || echo bad)"
+check "built tool --paginate stdout is still pure JSON" "ok" "$(python3 -c 'import json,sys; json.load(open(sys.argv[1])); print("ok")' "$built_out" 2>&1)"
+check "built tool --paginate never mixes a diagnostic into stdout" "ok" "$(grep -q 'collected\|pagedemo:' "$built_out" && echo bad || echo ok)"
+
 # --- 16b. MCP pagination parity (spec §20, §27, §29) ---
 #
 # The CLI gained --paginate; MCP must not be a second execution model that

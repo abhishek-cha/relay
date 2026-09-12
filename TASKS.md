@@ -300,7 +300,8 @@ request input value finds nothing.
 
 - [x] A gRPC operation may name its method literally — `request.package` / `request.service` / `request.method` assemble `/package.Service/Method`; the fields are grpc-only, must be declared together, and `request.path` addressing still works, with both forms at once rejected as ambiguous — `internal/manifest`, `internal/protocol/grpc`
 - [x] The pagination opt-in crosses the MCP seam — an operation that declares a strategy advertises an optional `paginate` argument, the walk's `pages`/`truncated` shape rides in the MCP result, and a caller asking an incapable invoker to paginate is refused rather than handed page one — `internal/mcp`
- - [x] Browser OAuth2 redirect/authorization-code login — it landed in `internal/auth/browser.go` with PKCE, a loopback listener, and a single-use ten-minute handle rather than in `internal/browser`; the device grant stays for tools that declare only device endpoints
+- [x] Browser OAuth2 redirect/authorization-code login — it landed in `internal/auth/browser.go` with PKCE, a loopback listener, and a single-use ten-minute handle rather than in `internal/browser`; the device grant stays for tools that declare only device endpoints
+- [x] The pagination opt-in reaches a built tool binary — `--paginate` is reserved on an operation's flag set only when its manifest declares a strategy, so an incapable operation refuses the flag as `INVALID_INPUT` instead of ignoring it; the walk's shape is reported on stderr and stdout stays the pure result — `internal/runtime`
 
 ## M11 — Security, permissions, distribution  (§24, §25, §40, §41, §47, §48, §49)
 

@@ -261,8 +261,8 @@ relay/
 │   ├── protocol/
 │   │   ├── rest/       # REST executor
 │   │   ├── graphql/    # GraphQL executor
-│   │   ├── local/      # LocalExecutor (filesystem, git)
-│   │   └── grpc/
+│   │   ├── grpc/       # gRPC executor
+│   │   └── browser/    # session-carrying HTTP executor
 │   ├── mcp/
 │   ├── telemetry/
 │   ├── permissions/
@@ -278,13 +278,14 @@ relay/
 ├── examples/
 │   ├── github/         # github.yaml + SKILL.md (canonical pair)
 │   ├── slack/          # slack.yaml + SKILL.md
-│   ├── filesystem/     # filesystem.yaml + SKILL.md (local capability)
+│   ├── browser/        # browser.yaml + SKILL.md (login-form service)
 │   └── stripe/         # stripe.yaml (manifest-only draft)
 │
 ├── skills/
 │
 ├── docs/
 │   ├── DESIGN.md
+│   ├── CAPABILITIES.md
 │   └── CONTRIBUTING.md
 │
 ├── scripts/e2e.sh
@@ -797,21 +798,16 @@ Example:
 protocol:
   type: rest
 
-GraphQL is implemented today:
+REST, GraphQL, gRPC, and browser are all implemented today:
 
 protocol:
   type: graphql
 
-The local capability family is implemented too, so a tool can describe the
-machine it runs on rather than a remote API (spec 46):
-
-protocol:
-  type: local
-
-gRPC and browser are not:
-
 protocol:
   type: grpc
+
+protocol:
+  type: browser
 
 The CLI and MCP layers should not care.
 

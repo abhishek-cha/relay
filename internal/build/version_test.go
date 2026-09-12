@@ -62,7 +62,7 @@ func TestCheckSkillVersionReportsBothVersions(t *testing.T) {
 // example must still pass the same gates relay build runs, so a version-less
 // skill keeps building and none restates the schema.
 func TestExamplesPassSkillGates(t *testing.T) {
-	for _, name := range []string{"filesystem", "github", "slack", "stripe"} {
+	for _, name := range []string{"browser", "github", "slack", "stripe"} {
 		t.Run(name, func(t *testing.T) {
 			doc, err := manifest.Parse(mustReadFile(t, filepath.Join("..", "..", "examples", name, name+".yaml")))
 			if err != nil {

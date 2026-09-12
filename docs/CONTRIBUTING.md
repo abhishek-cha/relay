@@ -23,7 +23,7 @@ than failing on the first (spec §59). The rules:
 
 - `apiVersion: relay/v1` and `kind: Tool` are required and exact.
 - `metadata.name` is lowercase snake_case; `metadata.version` is required.
-- `protocol.type` is one of `rest`, `graphql`, `grpc`, `browser`, `local`.
+- `protocol.type` is one of `rest`, `graphql`, `grpc`, `browser`.
   `baseUrl` is required for `rest` and `endpoint` for `graphql` (spec §19).
 - `auth` is optional; when present its `type` is one of `api_key`, `bearer`,
   `basic`, `oauth2`, `client_credentials`. The manifest states the requirement;
@@ -129,10 +129,12 @@ stdio and routes each call through the same daemon path as the CLI (spec §27,
 }
 ```
 
-## A note on local capabilities
+## A note on the browser example
 
-Not every tool wraps a remote API. [`examples/filesystem/`](../examples/filesystem/filesystem.yaml)
-models a local capability with `protocol.type: local`. Relay ships only the REST
-executor today, so that example builds and documents the model but does not
-execute; do not present a non-REST tool as working until its executor exists
-(spec §46).
+Not every service has an API worth wrapping. [`examples/browser/`](../examples/browser/browser.yaml)
+models one that is only reachable through a login form: Relay performs the login once
+from the Keychain credential, stores the session, and attaches it to later operations.
+The operations themselves stay ordinary HTTP requests.
+
+The full manifest shape for every protocol and credential type is in
+[`CAPABILITIES.md`](CAPABILITIES.md).

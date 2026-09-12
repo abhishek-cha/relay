@@ -72,6 +72,8 @@ tools:
     request:
       method: GET
       path: /items
+      pagination:
+        style: link-header
 `
 
 const demoSkill = "# Demo\n\nUse get-thing to fetch a thing.\n"
@@ -930,5 +932,211 @@ func TestOperationName(t *testing.T) {
 		if got := operationName(input); got != want {
 			t.Fatalf("operationName(%q) = %q, want %q", input, got, want)
 		}
+	}
+}
+
+// paginatedReply is the scripted reply a paginating operation returns: a
+// machine result plus the walk's shape, exactly as the daemon reports it.
+func paginatedReply(result any, pages int, truncated bool) *fakeInvoker {
+	return &fakeInvoker{reply: func(relay.InvokeRequest) (relay.InvokeResponse, error) {
+		return relay.InvokeResponse{Success: true, Result: result, Pages: pages, Truncated: truncated}, nil
+	}}
+}
+
+// --paginate is the reserved opt-in that exists only where the manifest declares
+// a pagination strategy (spec §20). On a capable operation it reaches the
+// invoker as InvokeRequest.Paginate, so a built binary can walk pages itself
+// rather than only the CLI's run being able to.
+func TestRunPaginateForwardsToInvoker(t *testing.T) {
+	invoker := paginatedReply([]string{"a", "b", "c"}, 3, false)
+	app, stdout, stderr := newDemoApp(t, invoker)
+	got := runApp(t, app, stdout, stderr, "search-items", "--query", "q", "--paginate")
+	if got.code != ExitOK {
+		t.Fatalf("exit = %d, want %d (stderr: %s)", got.code, ExitOK, got.stderr)
+	}
+	request := singleInvocation(t, invoker)
+	if !request.Paginate {
+		t.Fatalf("--paginate must forward Paginate=true, got %+v", request)
+	}
+	if request.Operation != "search_items" {
+		t.Fatalf("operation = %q, want search_items", request.Operation)
+	}
+}
+
+// The walk's shape is a human diagnostic: it belongs on stderr, and stdout stays
+// the lone machine result so a caller parsing JSON is never handed a stray line.
+func TestRunPaginateReportsWalkOnStderr(t *testing.T) {
+	invoker := paginatedReply([]string{"a", "b", "c"}, 3, false)
+	app, stdout, stderr := newDemoApp(t, invoker)
+	got := runApp(t, app, stdout, stderr, "search-items", "--query", "q", "--paginate")
+	if got.code != ExitOK {
+		t.Fatalf("exit = %d, want %d (stderr: %s)", got.code, ExitOK, got.stderr)
+	}
+	if !strings.Contains(got.stderr, "collected 3 pages") {
+		t.Fatalf("stderr = %q, want the walk report", got.stderr)
+	}
+	if strings.Contains(got.stdout, "collected") {
+		t.Fatalf("diagnostic mixed into stdout: %q", got.stdout)
+	}
+	var result []string
+	decodeSingleJSON(t, got.stdout, &result)
+	if !reflect.DeepEqual(result, []string{"a", "b", "c"}) {
+		t.Fatalf("stdout = %#v, want the machine result alone", result)
+	}
+}
+
+// The reporting mirrors the CLI's reportPagination exactly: silent when no walk
+// happened, singular for one page, plural otherwise, and it names a truncated
+// walk so a bounded result is never read as complete (spec §20).
+func TestRunPaginateWalkReporting(t *testing.T) {
+	tests := []struct {
+		name       string
+		response   relay.InvokeResponse
+		wantStderr string
+	}{
+		{name: "no walk is silent", response: relay.InvokeResponse{Success: true}},
+		{name: "single page is singular", response: relay.InvokeResponse{Success: true, Pages: 1}, wantStderr: "collected 1 page"},
+		{name: "many pages", response: relay.InvokeResponse{Success: true, Pages: 3}, wantStderr: "collected 3 pages"},
+		{
+			name:       "truncated walk is named",
+			response:   relay.InvokeResponse{Success: true, Pages: 2, Truncated: true},
+			wantStderr: "collected 2 pages; the result is truncated and may be incomplete",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			invoker := &fakeInvoker{reply: func(relay.InvokeRequest) (relay.InvokeResponse, error) {
+				return test.response, nil
+			}}
+			app, stdout, stderr := newDemoApp(t, invoker)
+			got := runApp(t, app, stdout, stderr, "search-items", "--query", "q", "--paginate")
+			if got.code != ExitOK {
+				t.Fatalf("exit = %d, want %d (stderr: %s)", got.code, ExitOK, got.stderr)
+			}
+			if test.wantStderr == "" {
+				if got.stderr != "" {
+					t.Fatalf("stderr = %q, want empty", got.stderr)
+				}
+				return
+			}
+			if !strings.Contains(got.stderr, test.wantStderr) {
+				t.Fatalf("stderr = %q, want it to contain %q", got.stderr, test.wantStderr)
+			}
+		})
+	}
+}
+
+// An operation whose manifest declares no pagination does not have the flag, so
+// asking it to paginate is refused as INVALID_INPUT rather than silently ignored
+// the same refuse-don't-pretend contract the MCP adapter enforces.
+func TestRunPaginateRefusedWithoutStrategy(t *testing.T) {
+	t.Run("stderr diagnostic", func(t *testing.T) {
+		invoker := okInvoker()
+		app, stdout, stderr := newDemoApp(t, invoker)
+		got := runApp(t, app, stdout, stderr, "get-thing", "--id", "x", "--paginate")
+		if got.code != ExitError {
+			t.Fatalf("exit = %d, want %d", got.code, ExitError)
+		}
+		if got.stdout != "" {
+			t.Fatalf("stdout = %q, want empty", got.stdout)
+		}
+		if !strings.Contains(got.stderr, string(relay.CodeInvalidInput)) {
+			t.Fatalf("stderr = %q, want INVALID_INPUT", got.stderr)
+		}
+		if len(invoker.calls) != 0 {
+			t.Fatalf("a refused walk must not reach the invoker, got %d call(s)", len(invoker.calls))
+		}
+	})
+
+	t.Run("json envelope", func(t *testing.T) {
+		invoker := okInvoker()
+		app, stdout, stderr := newDemoApp(t, invoker)
+		got := runApp(t, app, stdout, stderr, "--json", "get-thing", "--id", "x", "--paginate")
+		if got.code != ExitError {
+			t.Fatalf("exit = %d, want %d", got.code, ExitError)
+		}
+		if got.stderr != "" {
+			t.Fatalf("stderr = %q, want empty under --json", got.stderr)
+		}
+		var envelope relay.InvokeResponse
+		decodeSingleJSON(t, got.stdout, &envelope)
+		if envelope.Error == nil || envelope.Error.Code != relay.CodeInvalidInput {
+			t.Fatalf("envelope error = %+v, want INVALID_INPUT", envelope.Error)
+		}
+		if len(invoker.calls) != 0 {
+			t.Fatalf("a refused walk must not reach the invoker, got %d call(s)", len(invoker.calls))
+		}
+	})
+}
+
+// --paginate composes with the global --json flag: the envelope is the lone JSON
+// document on stdout and the walk diagnostic still goes to stderr.
+func TestRunPaginateWithJSONEnvelope(t *testing.T) {
+	invoker := paginatedReply(map[string]any{"items": []string{"a", "b", "c"}}, 3, false)
+	app, stdout, stderr := newDemoApp(t, invoker)
+	got := runApp(t, app, stdout, stderr, "--json", "search-items", "--query", "q", "--paginate")
+	if got.code != ExitOK {
+		t.Fatalf("exit = %d, want %d (stderr: %s)", got.code, ExitOK, got.stderr)
+	}
+	if !strings.Contains(got.stderr, "collected 3 pages") {
+		t.Fatalf("stderr = %q, want the walk report", got.stderr)
+	}
+	if !singleInvocation(t, invoker).Paginate {
+		t.Fatal("--paginate must still be forwarded under --json")
+	}
+	var envelope relay.InvokeResponse
+	decodeSingleJSON(t, got.stdout, &envelope)
+	if !envelope.Success || envelope.Error != nil {
+		t.Fatalf("unexpected envelope: %+v", envelope)
+	}
+	if strings.Contains(got.stdout, "collected") {
+		t.Fatalf("diagnostic mixed into JSON stdout: %q", got.stdout)
+	}
+}
+
+// The reserved flag is advertised only where it is accepted: it shows up in a
+// capable operation's usage and nowhere else, so --help never promises a flag
+// the operation will refuse (spec 20).
+func TestRunOperationHelpAdvertisesPaginateOnlyWhenDeclared(t *testing.T) {
+	app, stdout, _ := newDemoApp(t, okInvoker())
+	if got := runApp(t, app, stdout, &bytes.Buffer{}, "search-items", "--help"); !strings.Contains(got.stdout, "--paginate") {
+		t.Fatalf("paginating operation usage missing --paginate:\n%s", got.stdout)
+	}
+	app, stdout, _ = newDemoApp(t, okInvoker())
+	if got := runApp(t, app, stdout, &bytes.Buffer{}, "get-thing", "--help"); strings.Contains(got.stdout, "--paginate") {
+		t.Fatalf("non-paginating operation usage advertised --paginate:\n%s", got.stdout)
+	}
+}
+
+// The discovery paths keep working exactly as before: a trailing global-looking
+// argument never turns --describe, --skill, or --manifest into an invocation or
+// mixes a walk diagnostic into their output (spec §9, §13).
+func TestRunPaginateDoesNotDisturbDiscoveryPaths(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "describe", args: []string{"--describe", "--paginate"}},
+		{name: "skill", args: []string{"--skill", "--paginate"}},
+		{name: "manifest", args: []string{"--manifest", "--paginate"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			invoker := okInvoker()
+			app, stdout, stderr := newDemoApp(t, invoker)
+			got := runApp(t, app, stdout, stderr, test.args...)
+			if got.code != ExitOK {
+				t.Fatalf("exit = %d, want %d (stderr: %s)", got.code, ExitOK, got.stderr)
+			}
+			if got.stderr != "" {
+				t.Fatalf("stderr = %q, want empty", got.stderr)
+			}
+			if got.stdout == "" {
+				t.Fatal("discovery path produced no output")
+			}
+			if len(invoker.calls) != 0 {
+				t.Fatalf("a discovery path must not invoke, got %d call(s)", len(invoker.calls))
+			}
+		})
 	}
 }
