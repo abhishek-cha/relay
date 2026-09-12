@@ -435,7 +435,7 @@ relay/
 ├── templates/          # manifest + SKILL.md starting points
 ├── examples/           # worked examples: github, slack, stripe, filesystem
 ├── docs/               # DESIGN.md, CONTRIBUTING.md
-├── scripts/e2e.sh      # end-to-end suite
+├── scripts/e2e.sh      # end-to-end suite (entrypoint; e2e/ holds the halves)
 ├── TASKS.md            # the phased build-out checklist
 └── README.md
 ```

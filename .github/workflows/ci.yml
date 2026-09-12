@@ -22,13 +22,15 @@ jobs:
         run: go build ./...
       - name: test
         run: go test ./...
+      # The platform-neutral half of the end-to-end suite. It drives the real
+      # relayd but never touches a stored credential, so it runs anywhere.
+      - name: e2e (platform-neutral half)
+        run: bash scripts/e2e/core.sh
 
-  # The end-to-end suite drives the real relayd, and relayd reads credentials
-  # through /usr/bin/security — the macOS Keychain CLI. On Linux that binary
-  # does not exist, so every credential and session check fails for a reason
-  # that has nothing to do with the code under test. Relay is macOS-first by
-  # design (Keychain, LaunchAgent, security(1)), so this is the only place the
-  # suite can assert the credential seam truthfully.
+  # The macOS-only half: the checks that read and write the Keychain and the
+  # session store. relayd does that through /usr/bin/security, the macOS
+  # Keychain CLI, which does not exist on Linux, so this half can only run
+  # here. Relay is macOS-first by design (Keychain, LaunchAgent, security(1)).
   e2e:
     runs-on: macos-latest
     steps:
@@ -36,5 +38,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.22"
+      # Runs core.sh unconditionally and macos.sh on Darwin, then reports one
+      # aggregate count.
       - name: e2e
         run: bash scripts/e2e.sh

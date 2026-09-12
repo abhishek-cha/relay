@@ -289,6 +289,7 @@ relay/
 │   └── CONTRIBUTING.md
 │
 ├── scripts/e2e.sh
+├── scripts/e2e/          # core.sh (platform-neutral) + macos.sh (Keychain)
 ├── Makefile
 ├── go.mod
 ├── go.sum

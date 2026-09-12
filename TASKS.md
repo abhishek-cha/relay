@@ -236,8 +236,9 @@ The parity assertions land in e2e section 11 (M8); the skill is served through t
 - [x] Unit — protocol: REST against `httptest` — `internal/protocol/rest/rest_test.go`
 - [x] Security: unauthorized tool access, missing credentials, permission violations, credential leakage, MCP permission bypass — `internal/keychain/security_test.go`, `internal/daemon/security_test.go`, `internal/mcp/security_test.go`
 - [x] E2E script (§60): build → `--describe` → install → invoke → `--skill` → MCP discovery → MCP invoke → assert CLI/MCP parity — `scripts/e2e.sh`
+- [x] The suite is split on its platform boundary — `scripts/e2e/core.sh` is the platform-neutral half and `scripts/e2e/macos.sh` holds the checks that need a real Keychain or session, with `scripts/e2e.sh` as the one-command entrypoint (core always, macOS half only on Darwin, one aggregate count). Both halves own their own daemon and `RELAY_HOME`, so a failure in one cannot cascade into the other — `scripts/e2e/`
 - [x] Emit a local usage event on each invocation (§31)
-- [x] `make e2e` runs in CI — `.github/workflows/ci.yml` runs `bash scripts/e2e.sh` on push and pull request
+- [x] `make e2e` runs in CI — `.github/workflows/ci.yml` runs the platform-neutral half on `ubuntu-latest` and the full suite on `macos-latest`, because the credential checks need `/usr/bin/security`
 
 **Acceptance (§61):** the 10-step Definition of Done below passes on a clean machine.
 
