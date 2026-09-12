@@ -2,6 +2,7 @@ package manifest
 
 import (
 	"fmt"
+	"net/url"
 	"regexp"
 	"sort"
 	"strings"
@@ -80,6 +81,7 @@ func (d *Document) Validate() error {
 		} else if !knownAuthTypes[d.Auth.Type] {
 			add("auth.type: unknown auth type %q", d.Auth.Type)
 		}
+		validateAuthBrowserFlow(d.Auth, add)
 	}
 
 	for _, capability := range d.Capabilities {
@@ -128,6 +130,67 @@ func (d *Document) Validate() error {
 		return &ValidationError{Problems: problems}
 	}
 	return nil
+}
+
+// validateAuthBrowserFlow checks the additive fields that declare an OAuth2
+// browser authorization-code + PKCE flow (spec §21, §23, §24, §40, §54).
+//
+// Naming auth.authorizationEndpoint is what selects the flow, so that endpoint
+// is meaningful only for auth.type oauth2 and only alongside the token endpoint
+// and client id the code exchange needs. The browser flow is a public client: a
+// browser flow that names a client secret is a mistake, and the manifest is not
+// a secret store (spec §21, §22), so no secret field is read or required here.
+// The browser and device grants are mutually exclusive, so declaring both
+// endpoints at once is ambiguous and rejected rather than silently resolved.
+//
+// auth.redirectURI is optional — absent, Relay binds an ephemeral loopback port
+// — but when present it must be a loopback http URL, because the daemon binds a
+// 127.0.0.1 listener and nothing else can receive the authorization code safely
+// (spec §23, §40). Every message names the field and never echoes the value.
+func validateAuthBrowserFlow(auth *Auth, add func(string, ...any)) {
+	if auth.AuthorizationEndpoint != "" {
+		if auth.Type != "oauth2" {
+			add("auth.authorizationEndpoint: only allowed for auth.type oauth2; it selects the browser authorization-code flow")
+		}
+		if auth.DeviceAuthorizationEndpoint != "" {
+			add("auth.authorizationEndpoint: not allowed together with auth.deviceAuthorizationEndpoint; the browser and device flows are mutually exclusive")
+		}
+		if auth.TokenEndpoint == "" {
+			add("auth.tokenEndpoint: required when auth.authorizationEndpoint is set")
+		}
+		if auth.ClientID == "" {
+			add("auth.clientId: required when auth.authorizationEndpoint is set")
+		}
+	}
+
+	if auth.RedirectURI != "" {
+		if auth.AuthorizationEndpoint == "" {
+			add("auth.redirectURI: requires auth.authorizationEndpoint; a redirect URI means nothing without a browser flow")
+		}
+		validateLoopbackRedirectURI(auth.RedirectURI, add)
+	}
+}
+
+// validateLoopbackRedirectURI enforces the shape of a browser flow's callback
+// URL (spec §23, §40). The daemon binds a loopback listener, so the redirect
+// must be an absolute http URL whose host is 127.0.0.1 or localhost (an
+// optional port is allowed) and which carries no query and no fragment. The
+// value is never echoed: a redirect URI can embed a state or code parameter,
+// and a diagnostic must not reflect it back (spec §22, §40).
+func validateLoopbackRedirectURI(raw string, add func(string, ...any)) {
+	parsed, err := url.Parse(raw)
+	if err != nil || !parsed.IsAbs() || parsed.Host == "" || !strings.EqualFold(parsed.Scheme, "http") {
+		add("auth.redirectURI: must be an absolute URL whose scheme is http; the daemon binds a loopback listener")
+		return
+	}
+	switch strings.ToLower(parsed.Hostname()) {
+	case "127.0.0.1", "localhost":
+	default:
+		add("auth.redirectURI: host must be 127.0.0.1 or localhost; nothing else can receive the authorization code safely")
+	}
+	if strings.Contains(raw, "?") || strings.Contains(raw, "#") {
+		add("auth.redirectURI: must not carry a query or fragment")
+	}
 }
 
 // validateRequest checks the shape of a single operation's request block. The

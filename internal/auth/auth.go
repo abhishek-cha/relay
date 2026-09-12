@@ -158,6 +158,29 @@ func (r *Resolver) Present(tool string) (bool, *relay.Error) {
 		keychain.Redact(fmt.Sprintf("could not read the stored credential for %q: %v", tool, err), secret))
 }
 
+// Stored reads a tool's token envelope. ok is false, with no error, when
+// nothing is stored or the stored value is not an envelope — a token a human
+// pasted is not one, and callers must fall back to the manual path (spec §59).
+//
+// The Keychain read error path mirrors Resolve and Present: a missing item is
+// the ordinary "not logged in" case, and any other failure is AUTH_FAILED with
+// the value scrubbed (spec §22).
+func (r *Resolver) Stored(tool string) (StoredToken, bool, *relay.Error) {
+	secret, err := r.store.Get(keychain.Service(tool), keychain.AccountDefault)
+	if err != nil {
+		if errors.Is(err, keychain.ErrNotFound) {
+			return StoredToken{}, false, nil
+		}
+		return StoredToken{}, false, relay.NewError(relay.CodeAuthFailed,
+			keychain.Redact(fmt.Sprintf("could not read the stored credential for %q: %v", tool, err), secret))
+	}
+	stored, ok := DecodeStoredToken(secret)
+	if !ok {
+		return StoredToken{}, false, nil
+	}
+	return stored, true, nil
+}
+
 // Set stores a tool's credential. The secret is written to the Keychain and is
 // never echoed in the returned error (spec §22, §54).
 func (r *Resolver) Set(tool, secret string) *relay.Error {
@@ -191,12 +214,26 @@ func authRequired(tool string, declared manifest.Auth) *relay.Error {
 }
 
 // encodeSecret applies the per-type transformation that turns the stored value
-// into the wire value. Only HTTP Basic needs one: it carries base64(user:pass),
-// and the stored value is the raw "user:pass" pair (or client_id:client_secret).
+// into the wire value.
+//
+// HTTP Basic carries base64(user:pass), and the stored value is the raw
+// "user:pass" pair (or client_id:client_secret).
+//
+// For the token-bearing types (oauth2, bearer) the stored value may be a token
+// envelope. When it is, the wire value is the envelope's access token, which is
+// how a background refresh can recover the refresh token that a bare string
+// would have thrown away (spec §21, §22). When it is not, the stored value is a
+// token a human pasted, and the fallback returns it verbatim so pasted tokens
+// keep working unchanged (spec §59).
 func encodeSecret(canonical, secret string) string {
 	switch canonical {
 	case "basic", "client_credentials":
 		return base64.StdEncoding.EncodeToString([]byte(secret))
+	case "oauth2", "bearer":
+		if stored, ok := DecodeStoredToken(secret); ok {
+			return stored.AccessValue()
+		}
+		return secret
 	default:
 		return secret
 	}

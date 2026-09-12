@@ -27,7 +27,13 @@ type manifestAuthBlock struct {
 		DeviceAuthorizationEndpoint string `yaml:"deviceAuthorizationEndpoint"`
 		TokenEndpoint               string `yaml:"tokenEndpoint"`
 		ClientID                    string `yaml:"clientId"`
-		Scopes                      any    `yaml:"scopes"`
+		// AuthorizationEndpoint and RedirectURI select the browser
+		// authorization-code + PKCE flow instead of the device grant. They are
+		// read here only so the device reader can recognise a browser manifest
+		// and refuse to misread it as a broken device one.
+		AuthorizationEndpoint string `yaml:"authorizationEndpoint"`
+		RedirectURI           string `yaml:"redirectURI"`
+		Scopes                any    `yaml:"scopes"`
 	} `yaml:"auth"`
 }
 
@@ -48,6 +54,13 @@ func DeviceFlowSpecFromManifest(manifestYAML []byte) (spec DeviceFlowSpec, ok bo
 			"the manifest could not be read for its auth block")
 	}
 	if document.Auth == nil || Canonical(document.Auth.Type) != "oauth2" {
+		return DeviceFlowSpec{}, false, nil
+	}
+	if strings.TrimSpace(document.Auth.AuthorizationEndpoint) != "" {
+		// A browser-flow manifest also declares tokenEndpoint and clientId,
+		// which would otherwise look like a device declaration missing its
+		// deviceAuthorizationEndpoint. The two flows are mutually exclusive,
+		// so this is a browser manifest, not a broken device one.
 		return DeviceFlowSpec{}, false, nil
 	}
 

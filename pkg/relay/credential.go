@@ -38,9 +38,13 @@ type AuthStatusRequest struct {
 
 // AuthStatusResponse reports the presence and declared type of a credential.
 //
-// The secret is never included (spec §22). The reply is built from a presence
-// check and the tool's manifest, so the value is never read out even to be
-// redacted.
+// The summary fields (AuthType, Provider, LoginKind, ExpiresAt, Scope,
+// Refreshable) are non-secret metadata about the stored credential: what kind of
+// login produced it, when it expires, which scopes it holds, and whether a
+// refresh token is stored. They let the CLI describe the credential without ever
+// seeing it. The value itself is never included (spec §22): the reply is built
+// from a presence check, the tool's manifest, and stored non-secret metadata, so
+// the secret is never read out even to be redacted.
 type AuthStatusResponse struct {
 	Success  bool   `json:"success"`
 	Error    *Error `json:"error,omitempty"`
@@ -48,4 +52,12 @@ type AuthStatusResponse struct {
 	Stored   bool   `json:"stored"`             // true when a secret is in the Keychain
 	AuthType string `json:"authType,omitempty"` // declared auth type (api_key, bearer, ...)
 	Provider string `json:"provider,omitempty"` // declared provider (e.g. github)
+
+	// The following are additive, non-secret summaries of the stored credential.
+	// All are omitempty so a legacy reply keeps exactly its old wire shape and no
+	// frame ever carries the credential value itself (spec §22).
+	LoginKind   string `json:"loginKind,omitempty"`   // e.g. "oauth2 browser", "oauth2 device", "pasted token"; empty when unknown
+	ExpiresAt   string `json:"expiresAt,omitempty"`   // RFC3339 UTC; empty when the server declared no expiry
+	Scope       string `json:"scope,omitempty"`       // space-delimited scopes the credential was granted
+	Refreshable bool   `json:"refreshable,omitempty"` // true when a refresh token is stored
 }

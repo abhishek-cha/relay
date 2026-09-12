@@ -1,6 +1,7 @@
 package manifest
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -589,6 +590,281 @@ func TestValidateRejectsGRPCMethodAddressing(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), test.wantErr) {
 				t.Fatalf("expected error to mention %q, got: %v", test.wantErr, err)
+			}
+		})
+	}
+}
+
+// The browser authorization-code + PKCE flow is selected by naming
+// auth.authorizationEndpoint; these cases guard its validation (spec §21, §23,
+// §40, §54).
+
+// Distinctive values used by the rejection cases so a test can prove the
+// validator never reflects a manifest value back in a diagnostic.
+const (
+	browserAuthorizeEndpoint = "https://id.example.test/oauth/authorize"
+	browserTokenEndpoint     = "https://id.example.test/oauth/token"
+	browserClientID          = "relay-public-client-id"
+)
+
+// A manifest that declares either flow, or neither, must validate: naming the
+// authorization endpoint selects the browser flow, the device fields select the
+// device flow, and an oauth2 block with no endpoints keeps meaning "a human
+// pastes a token" (spec §21, §54).
+func TestValidateAcceptsAuthFlows(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Auth)
+	}{
+		{
+			name: "browser flow with loopback redirect",
+			mutate: func(a *Auth) {
+				a.Type = "oauth2"
+				a.AuthorizationEndpoint = browserAuthorizeEndpoint
+				a.TokenEndpoint = browserTokenEndpoint
+				a.ClientID = browserClientID
+				a.RedirectURI = "http://127.0.0.1:53682/callback"
+			},
+		},
+		{
+			name: "browser flow without a redirect",
+			mutate: func(a *Auth) {
+				a.Type = "oauth2"
+				a.AuthorizationEndpoint = browserAuthorizeEndpoint
+				a.TokenEndpoint = browserTokenEndpoint
+				a.ClientID = browserClientID
+			},
+		},
+		{
+			name: "browser flow with localhost redirect",
+			mutate: func(a *Auth) {
+				a.Type = "oauth2"
+				a.AuthorizationEndpoint = browserAuthorizeEndpoint
+				a.TokenEndpoint = browserTokenEndpoint
+				a.ClientID = browserClientID
+				a.RedirectURI = "http://localhost:49152/callback"
+			},
+		},
+		{
+			name: "device flow",
+			mutate: func(a *Auth) {
+				a.Type = "oauth2"
+				a.DeviceAuthorizationEndpoint = "https://id.example.test/oauth/device"
+				a.TokenEndpoint = browserTokenEndpoint
+				a.ClientID = browserClientID
+			},
+		},
+		{
+			name:   "oauth2 pasted token",
+			mutate: func(a *Auth) { a.Type = "oauth2" },
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			doc := mustParse(t, validManifest)
+			test.mutate(doc.Auth)
+			if err := doc.Validate(); err != nil {
+				t.Fatalf("expected valid manifest, got: %v", err)
+			}
+		})
+	}
+}
+
+// TestValidateRejectsAuthFlows covers each browser-flow rule named in spec §21,
+// §23 and §40. Alongside the expected message it asserts that no value from the
+// manifest is echoed: a diagnostic must name the field and never reflect a token,
+// client id, or redirect URI back (spec §22, §40).
+func TestValidateRejectsAuthFlows(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*Auth)
+		wantErr string
+	}{
+		{
+			name: "authorizationEndpoint is not oauth2",
+			mutate: func(a *Auth) {
+				a.AuthorizationEndpoint = browserAuthorizeEndpoint
+			},
+			wantErr: "auth.authorizationEndpoint: only allowed for auth.type oauth2",
+		},
+		{
+			name: "authorizationEndpoint without tokenEndpoint",
+			mutate: func(a *Auth) {
+				a.Type = "oauth2"
+				a.AuthorizationEndpoint = browserAuthorizeEndpoint
+				a.ClientID = browserClientID
+			},
+			wantErr: "auth.tokenEndpoint: required when auth.authorizationEndpoint is set",
+		},
+		{
+			name: "authorizationEndpoint without clientId",
+			mutate: func(a *Auth) {
+				a.Type = "oauth2"
+				a.AuthorizationEndpoint = browserAuthorizeEndpoint
+				a.TokenEndpoint = browserTokenEndpoint
+			},
+			wantErr: "auth.clientId: required when auth.authorizationEndpoint is set",
+		},
+		{
+			name: "both browser and device flows",
+			mutate: func(a *Auth) {
+				a.Type = "oauth2"
+				a.AuthorizationEndpoint = browserAuthorizeEndpoint
+				a.DeviceAuthorizationEndpoint = "https://id.example.test/oauth/device"
+				a.TokenEndpoint = browserTokenEndpoint
+				a.ClientID = browserClientID
+			},
+			wantErr: "auth.authorizationEndpoint: not allowed together with auth.deviceAuthorizationEndpoint",
+		},
+		{
+			name: "redirectURI without authorizationEndpoint",
+			mutate: func(a *Auth) {
+				a.Type = "oauth2"
+				a.RedirectURI = "http://127.0.0.1:53682/callback"
+			},
+			wantErr: "auth.redirectURI: requires auth.authorizationEndpoint",
+		},
+		{
+			name: "redirectURI relative",
+			mutate: func(a *Auth) {
+				a.Type = "oauth2"
+				a.AuthorizationEndpoint = browserAuthorizeEndpoint
+				a.TokenEndpoint = browserTokenEndpoint
+				a.ClientID = browserClientID
+				a.RedirectURI = "/callback"
+			},
+			wantErr: "auth.redirectURI: must be an absolute URL whose scheme is http",
+		},
+		{
+			name: "redirectURI remote https",
+			mutate: func(a *Auth) {
+				a.Type = "oauth2"
+				a.AuthorizationEndpoint = browserAuthorizeEndpoint
+				a.TokenEndpoint = browserTokenEndpoint
+				a.ClientID = browserClientID
+				a.RedirectURI = "https://example.test/callback"
+			},
+			wantErr: "auth.redirectURI: must be an absolute URL whose scheme is http",
+		},
+		{
+			name: "redirectURI https loopback",
+			mutate: func(a *Auth) {
+				a.Type = "oauth2"
+				a.AuthorizationEndpoint = browserAuthorizeEndpoint
+				a.TokenEndpoint = browserTokenEndpoint
+				a.ClientID = browserClientID
+				a.RedirectURI = "https://127.0.0.1:53682/callback"
+			},
+			wantErr: "auth.redirectURI: must be an absolute URL whose scheme is http",
+		},
+		{
+			name: "redirectURI non-loopback host",
+			mutate: func(a *Auth) {
+				a.Type = "oauth2"
+				a.AuthorizationEndpoint = browserAuthorizeEndpoint
+				a.TokenEndpoint = browserTokenEndpoint
+				a.ClientID = browserClientID
+				a.RedirectURI = "http://example.test/callback"
+			},
+			wantErr: "auth.redirectURI: host must be 127.0.0.1 or localhost",
+		},
+		{
+			name: "redirectURI with query",
+			mutate: func(a *Auth) {
+				a.Type = "oauth2"
+				a.AuthorizationEndpoint = browserAuthorizeEndpoint
+				a.TokenEndpoint = browserTokenEndpoint
+				a.ClientID = browserClientID
+				a.RedirectURI = "http://127.0.0.1:53682/callback?state=present"
+			},
+			wantErr: "auth.redirectURI: must not carry a query or fragment",
+		},
+		{
+			name: "redirectURI with fragment",
+			mutate: func(a *Auth) {
+				a.Type = "oauth2"
+				a.AuthorizationEndpoint = browserAuthorizeEndpoint
+				a.TokenEndpoint = browserTokenEndpoint
+				a.ClientID = browserClientID
+				a.RedirectURI = "http://localhost:8080/callback#frag"
+			},
+			wantErr: "auth.redirectURI: must not carry a query or fragment",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			doc := mustParse(t, validManifest)
+			test.mutate(doc.Auth)
+			err := doc.Validate()
+			if err == nil {
+				t.Fatalf("expected an error mentioning %q", test.wantErr)
+			}
+			if !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("expected error to mention %q, got: %v", test.wantErr, err)
+			}
+			for _, value := range []string{
+				doc.Auth.AuthorizationEndpoint,
+				doc.Auth.DeviceAuthorizationEndpoint,
+				doc.Auth.TokenEndpoint,
+				doc.Auth.ClientID,
+				doc.Auth.RedirectURI,
+			} {
+				if value != "" && strings.Contains(err.Error(), value) {
+					t.Fatalf("error echoed a manifest value, got: %v", err)
+				}
+			}
+		})
+	}
+}
+
+// The two additive browser-flow fields decode from both encodings the schema
+// declares, so a YAML manifest and a JSON manifest name the flow identically
+// (spec §21, §54).
+const browserFlowYAML = `apiVersion: relay/v1
+kind: Tool
+metadata:
+  name: demo
+  version: 1.0.0
+auth:
+  type: oauth2
+  authorizationEndpoint: https://id.example.test/oauth/authorize
+  redirectURI: http://127.0.0.1:53682/callback
+`
+
+const browserFlowJSON = `{"apiVersion":"relay/v1","kind":"Tool","metadata":{"name":"demo","version":"1.0.0"},"auth":{"type":"oauth2","authorizationEndpoint":"https://id.example.test/oauth/authorize","redirectURI":"http://127.0.0.1:53682/callback"}}`
+
+func TestAuthBrowserFlowFieldsRoundTrip(t *testing.T) {
+	tests := []struct {
+		name   string
+		text   string
+		decode func([]byte) (*Document, error)
+	}{
+		{"yaml", browserFlowYAML, Parse},
+		{"json", browserFlowJSON, func(data []byte) (*Document, error) {
+			var doc Document
+			if err := json.Unmarshal(data, &doc); err != nil {
+				return nil, err
+			}
+			return &doc, nil
+		}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			doc, err := test.decode([]byte(test.text))
+			if err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if doc.Auth == nil {
+				t.Fatal("auth block did not decode")
+			}
+			if doc.Auth.AuthorizationEndpoint != browserAuthorizeEndpoint {
+				t.Fatalf("authorizationEndpoint = %q, want %q", doc.Auth.AuthorizationEndpoint, browserAuthorizeEndpoint)
+			}
+			if doc.Auth.RedirectURI != "http://127.0.0.1:53682/callback" {
+				t.Fatalf("redirectURI = %q, want the loopback callback", doc.Auth.RedirectURI)
 			}
 		})
 	}

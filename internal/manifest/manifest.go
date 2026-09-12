@@ -68,6 +68,15 @@ type Auth struct {
 	TokenEndpoint               string   `yaml:"tokenEndpoint,omitempty" json:"tokenEndpoint,omitempty"`
 	ClientID                    string   `yaml:"clientId,omitempty" json:"clientId,omitempty"`
 	Scopes                      []string `yaml:"scopes,omitempty" json:"scopes,omitempty"`
+
+	// The two fields below declare a browser authorization-code + PKCE flow.
+	// Naming an authorization endpoint is what selects it; a loopback redirect
+	// is optional and absent means Relay picks an ephemeral 127.0.0.1 port. They
+	// are additive: an oauth2 block that omits them — device fields or not —
+	// keeps meaning "a human pastes a token" (spec §21, §54). The flow is a
+	// public client, so it never declares a client secret.
+	AuthorizationEndpoint string `yaml:"authorizationEndpoint,omitempty" json:"authorizationEndpoint,omitempty"`
+	RedirectURI           string `yaml:"redirectURI,omitempty" json:"redirectURI,omitempty"`
 }
 
 // Permissions is the declared policy surface (spec §25). Enforcement lands in a
